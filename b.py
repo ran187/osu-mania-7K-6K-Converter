@@ -10,9 +10,10 @@ Conversion rules:
      set BeatmapID to 0, set CircleSize to 6.
   2. [HitObjects]: Remove the 4th column (0-indexed: column 3).
      - If a note on column 4 is alone at its timestamp it is TRANSFERRED.
-       The target column is chosen to maximise the minimum time-distance
-       to the nearest note above / below on that column.  Ties are
-       broken randomly.
+       Signed distance to nearest interval edge is computed per column,
+       then two aggregates gate the transfer:
+         a = MIN(signed_dist): if a < 0, discard (horizontal crowding).
+         b = MAX(signed_dist): pick column with b (widest vertical gap).
      - If column 4 has company it is simply DELETED.
      - All long notes (type 128) become regular notes (type 1).
      - Columns are remapped: col<3 stay, col>3 shift down by 1.
@@ -33,8 +34,13 @@ TYPE_NORMAL = 1            # Hit object type for a normal (non-hold) note
 TYPE_NEW_COMBO = 5         # 1 | 4  — normal note with new-combo flag
 TYPE_HOLD = 128            # Bit mask for mania long-note / hold
 
-# 最大最小间距下限（ms）：若转移后最佳列的最小间距 < 此值，则丢弃该音符
-MIN_DIST_THRESHOLD = 250
+# Unified interval margin (ms).
+# Every note on a 6K column is modelled as an interval:
+#   - Normal note at time T  →  [T - MARGIN,  T + MARGIN]
+# A transfer candidate must fall strictly outside all intervals on a
+# column; the signed distance to the nearest interval edge is then used
+# to rank eligible columns.
+INTERVAL_MARGIN = 125
 
 
 # ====================== Helper Functions ======================
@@ -174,30 +180,42 @@ def read_groups(hit_object_lines):
 
 # ====================== Transfer Resolution ======================
 
-def resolve_transfers(transfer_candidates, col_times):
+def resolve_transfers(transfer_candidates, col_intervals):
     """
     Resolve column-4-alone notes that must be transferred to another column.
 
-    For each candidate (processed in ascending time order):
-      1. For each of the 6 possible target columns, find the nearest
-         note *above* (earlier) and *below* (later) using binary search
-         on the per-column sorted-time lists.
-      2. Compute  min_dist = min(distance_above, distance_below).
-         If a side has no neighbour that distance is ∞.
-      3. Pick the column whose min_dist is LARGEST — i.e. the column
-         where this note is most isolated from its neighbours.
-      4. When multiple columns share the same maximum min_dist, pick
-         randomly among them.
-      5. Won't insert the time of resolved notes into *col_times* because 
-         the time gap between consecutive notes in the same column is acceptable.
+    Unified interval model
+    ----------------------
+    Every non-column-4 note is represented as an interval:
+      - Normal note at time T   →  [T - MARGIN,  T + MARGIN]
+
+    For each transfer candidate at time T, we compute a *signed* distance
+    from T to the nearest interval edge on each of the 6 target columns:
+      - T is LEFT  of the interval  →  signed_dist = start - T      (> 0)
+      - T is RIGHT of the interval  →  signed_dist = T - end        (> 0)
+      - T is INSIDE the interval    →  signed_dist = -(distance to nearer edge)  (< 0)
+      - Column has no intervals     →  signed_dist = +∞
+
+    Two aggregate metrics across ALL 6 columns:
+      a. 最小最小值 a = MIN(signed_dist across all 6 columns).
+         If a < 0, T falls inside at least one column's interval →
+         the note would cause horizontal crowding; DISCARD it.
+      b. 最大最小值 b = MAX(signed_dist across all 6 columns).
+         When a ≥ 0, T is outside all intervals on all columns, so
+         b > 0 is guaranteed.  The column with signed_dist == b is the
+         one with the widest gap — best vertical spacing.
+         When multiple columns tie at b, pick randomly among them.
+
+    Resolved notes are always normal notes (type 1), not long notes.
 
     Parameters
     ----------
     transfer_candidates : list[dict]
         Parsed hit-object dicts needing transfer, already in time order.
-    col_times : list[list[int]]
-        Six lists of note times, one per 6K column, kept sorted ascending.
-       
+    col_intervals : list[list[tuple[int, int]]]
+        Six lists of (start, end) intervals, one per 6K column,
+        each sorted by start time.
+
     Returns
     -------
     list[dict]
@@ -206,44 +224,48 @@ def resolve_transfers(transfer_candidates, col_times):
     resolved = []
 
     for obj in transfer_candidates:
+        T = obj['time']
         best_cols = []
-        best_min_dist = -1
+        best_min_dist = -1                     # 最大最小值 b (best signed distance)
+        global_min_dist = float('inf')         # 最小最小值 a (worst signed distance)
 
         for col in range(TARGET_KEYS):
-            times = col_times[col]
+            intervals = col_intervals[col]
 
-            if not times:
+            if not intervals:
                 # Column is completely empty — ideal choice
-                min_dist = float('inf')
+                signed_dist = float('inf')
             else:
-                idx = bisect.bisect_left(times, obj['time'])
+                signed_dist = float('inf')
 
-                # Distance to the nearest note ABOVE (earlier time)
-                if idx > 0:
-                    dist_above = obj['time'] - times[idx - 1]
-                else:
-                    dist_above = float('inf')
+                for start, end in intervals:
+                    if start <= T <= end:
+                        # T is INSIDE this interval → signed distance is NEGATIVE
+                        inside_dist = -(min(T - start, end - T))
+                        signed_dist = min(signed_dist, inside_dist)
+                    elif T < start:
+                        # T is left of this interval
+                        signed_dist = min(signed_dist, start - T)
+                    else:  # T > end
+                        # T is right of this interval
+                        signed_dist = min(signed_dist, T - end)
 
-                # Distance to the nearest note BELOW (later time)
-                if idx < len(times):
-                    dist_below = times[idx] - obj['time']
-                else:
-                    dist_below = float('inf')
+            # ---- Track 最小最小值 a (minimum signed distance) ----
+            if signed_dist < global_min_dist:
+                global_min_dist = signed_dist
 
-                min_dist = min(dist_above, dist_below)
-
-            if min_dist > best_min_dist:
-                best_min_dist = min_dist
+            # ---- Track 最大最小值 b (maximum signed distance) ----
+            if signed_dist > best_min_dist:
+                best_min_dist = signed_dist
                 best_cols = [col]
-            elif min_dist == best_min_dist:
+            elif signed_dist == best_min_dist:
                 best_cols.append(col)
 
-        # ---- 最大最小间距下限检查 ----
-        # 如果最佳列的最小时间间距 < 125 ms，则丢弃该音符
-        if best_min_dist < MIN_DIST_THRESHOLD and best_min_dist != float('inf'):
+        # ---- 最小最小值 a < 0 → T falls inside some column's interval → discard ----
+        if global_min_dist < 0:
             continue
 
-        # Pick randomly among the tied best columns
+        # ---- Best column (b > 0 guaranteed since a ≥ 0) ----
         target_col = random.choice(best_cols)
         new_x = get_new_x(target_col)
 
@@ -270,20 +292,24 @@ def convert_hit_objects(hit_object_lines):
 
       Phase 1 — Single pass over groups (time order):
         - Non-column-4 notes: remap column & x, convert long→normal,
-          add to the output pool and per-column time index.
+          add to the output pool.  Build a unified interval list per
+          column (sorted by start time) for later transfer resolution.
         - Column-4-alone notes:  pushed to a transfer-candidate list.
         - Column-4-with-company:  silently discarded.
 
       Phase 2 — Resolve transfers (time order, using resolve_transfers):
-        - For each deferred note, search all 6 columns for the nearest
-          notes above / below, and pick the column that maximises the
-          minimum time distance to its neighbours.
+        - For each deferred note, check all 6 columns' intervals.
+          Signed distance is computed per column (positive = T outside,
+          negative = T inside, +∞ = empty).  Two aggregates:
+            a = MIN(signed_dist): if a < 0, discard (horizontal crowding).
+            b = MAX(signed_dist): pick column with b (best vertical gap).
 
       Phase 3 — Merge regular + resolved notes, sort by (time, x),
                 serialise with format_hit_object.
     """
-    # Per-column sorted time lists — built incrementally for bisect searches
-    col_times = [[] for _ in range(TARGET_KEYS)]
+    # Per-column unified intervals — sorted by start time
+    # Each interval is (T - MARGIN, T + MARGIN) for a normal note at T.
+    col_intervals = [[] for _ in range(TARGET_KEYS)]
 
     regular_notes = []          # output-ready dicts (remapped / converted)
     transfer_candidates = []    # column-4-alone notes, already in time order
@@ -323,12 +349,17 @@ def convert_hit_objects(hit_object_lines):
                 }
                 regular_notes.append(new_obj)
 
-                # Insert time into sorted per-column list
-                ins_idx = bisect.bisect_left(col_times[new_col], obj['time'])
-                col_times[new_col].insert(ins_idx, obj['time'])
+                # ---- Build interval ----
+                iv_start = obj['time'] - INTERVAL_MARGIN
+                iv_end = obj['time'] + INTERVAL_MARGIN
+
+                # Insert sorted by start time
+                ins_idx = bisect.bisect_left(
+                    col_intervals[new_col], (iv_start, iv_end))
+                col_intervals[new_col].insert(ins_idx, (iv_start, iv_end))
 
     # ---- Phase 2 --------------------------------------------------------
-    resolved_notes = resolve_transfers(transfer_candidates, col_times)
+    resolved_notes = resolve_transfers(transfer_candidates, col_intervals)
 
     # ---- Phase 3 --------------------------------------------------------
     all_notes = regular_notes + resolved_notes

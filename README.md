@@ -6,9 +6,9 @@ A set of three Python scripts that convert osu!mania 7-key (7K) beatmaps to 6-ke
 
 ## Features
 
-### a.py — Download Package Converter
+### a.py — Download Package Converter (Preserve Long Notes)
 
-Scans your **Downloads** folder for `.osz` beatmap packages, extracts them, runs **both** b.py and c.py on every 7K beatmap inside, then re-packs everything back into `.osz`. Each 7K beatmap gets two 6K versions in one shot — one with long notes removed, one with long notes preserved.
+Scans your **Downloads** folder for `.osz` beatmap packages, extracts them, runs **c.py** on every 7K beatmap inside, then re-packs everything back into `.osz`. Each 7K beatmap gets one 6K version with long notes preserved. Output files are suffixed with `_[726k_ln]`.
 
 ### b.py — Batch Converter (Remove Long Notes)
 
@@ -16,11 +16,11 @@ Walks your osu! **Songs** folder, finds every 7K mania `.osu` file, and creates 
 
 ### c.py — Batch Converter (Preserve Long Notes)
 
-Same as b.py, but **long notes on columns 1, 2, 3, 5, 6, 7 are preserved.** Column 4 notes are always converted to normal notes. The transfer algorithm uses a unified interval model to safely place column-4 notes without colliding with long-note bodies. Output files are suffixed with `_[726k_ln]`.
+Same as b.py, but **long notes on columns 1, 2, 3, 5, 6, 7 are preserved.** Column 4 notes are always converted to normal notes. The transfer algorithm uses a unified interval model with signed distances to safely place column-4 notes without colliding with long-note bodies. Output files are suffixed with `_[726k_ln]`.
 
 | Script | Scope | Long Notes | Output Suffix |
 |--------|-------|------------|---------------|
-| a.py | Downloads `.osz` | Both (removed + preserved) | `_[726k]` + `_[726k_ln]` |
+| a.py | Downloads `.osz` | Preserved (c.py) | `_[726k_ln]` |
 | b.py | Songs folder | Removed | `_[726k]` |
 | c.py | Songs folder | Preserved | `_[726k_ln]` |
 
@@ -60,7 +60,7 @@ Change the path to your own osu! Songs folder:
 
 To find your osu! folder: open osu! → **Options** → click **"Open osu! folder"** → enter the `Songs` subdirectory.
 
-### In `a.py` (line ~30):
+### In `a.py` (line ~28):
 
 ```python
 DOWNLOADS = r'C:\Users\SmdSa\Downloads'
@@ -82,7 +82,7 @@ python a.py
 
 1. Lists all `.osz` files in your Downloads folder.
 2. Asks `Convert all? (Y/N):` — type **Y** to proceed, **N** to exit.
-3. For each `.osz`: extracts → converts all 7K beatmaps (both styles) → re-packs.
+3. For each `.osz`: extracts → converts all 7K beatmaps (preserving LN) → re-packs.
 4. The converted `.osz` can be opened directly in osu! (Ctrl+O or double-click).
 
 ### b.py — Batch-convert entire Songs folder (remove LN)
@@ -110,7 +110,7 @@ python c.py
 
 The 7K → 6K conversion removes the **4th column** (0-indexed: column 3). Notes on that column are handled as follows:
 
-- **Alone at their timestamp** → transferred to the best-fitting 6K column (the one where the note lands in the widest gap).
+- **Alone at their timestamp** → transferred to the best-fitting 6K column.
 - **With company** (other columns playing at the same moment) → discarded.
 
 Columns 1, 2, 3 become columns 1, 2, 3; columns 5, 6, 7 become columns 4, 5, 6.
@@ -121,6 +121,6 @@ Metadata is updated: `BeatmapID` set to 0, `CircleSize` set to 6, `Creator` and 
 
 ## Notes
 
-- The scripts rely on each other: **a.py imports b.py and c.py** — keep all three files in the same folder.
+- **a.py imports c.py** — keep both files in the same folder. b.py is standalone.
 - The conversion is **non-destructive**: original `.osu` files are never overwritten. b.py and c.py create new files alongside the originals; a.py re-packs the `.osz` with both old and new files.
 - Tested on ~10 beatmaps; no issues found. If you encounter problems, please report them.

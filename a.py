@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-osu! Beatmap Download Converter
+osu! Beatmap Download Converter  (Preserve Long Notes)
 ====================================================================
 
 Checks the Downloads folder for .osz beatmap packages, extracts them,
-converts 7K mania beatmaps to 6K using both b.py (remove long notes)
-and c.py (preserve long notes), then re-packages as .osz.
+converts 7K mania beatmaps to 6K using c.py (preserve long notes),
+then re-packages as .osz.
 
-Each 7K beatmap in the package gets two 6K copies:
-  - _[726k].osu   — all notes become normal (b.py)
+Each 7K beatmap in the package gets one 6K copy:
   - _[726k_ln].osu   — non-column-4 long notes preserved (c.py)
 """
 
@@ -19,10 +18,9 @@ import tempfile
 import shutil
 import glob
 
-# Import conversion functions from sibling scripts.
-# Both modules guard main() with "if __name__ == '__main__'", so the import
-# is side-effect-free apart from defining their functions.
-import b
+# Import conversion functions from c.py.
+# The module guards main() with "if __name__ == '__main__'", so the import
+# is side-effect-free apart from defining its functions.
 import c
 
 # ====================== Configuration ======================
@@ -41,8 +39,8 @@ def find_osz_files(downloads_dir):
 def process_osz(osz_path):
     """
     Extract *osz_path* to a temporary directory, convert every 7K mania
-    .osu file found inside (both b.py and c.py style), then re-pack
-    everything back into the original .osz.
+    .osu file found inside (c.py style, preserving long notes), then
+    re-pack everything back into the original .osz.
 
     Returns True if at least one conversion took place, False otherwise.
     """
@@ -64,15 +62,11 @@ def process_osz(osz_path):
                     continue
                 full = os.path.join(root, fname)
 
-                if not b.is_mania_7k(full):
+                if not c.is_mania_7k(full):
                     continue          # not 7K mania — skip
 
-                r_b = b.convert_osu_file(full)
                 r_c = c.convert_osu_file(full)
 
-                if r_b:
-                    print(f"    b.py  →  {os.path.basename(r_b)}")
-                    converted_any = True
                 if r_c:
                     print(f"    c.py  →  {os.path.basename(r_c)}")
                     converted_any = True

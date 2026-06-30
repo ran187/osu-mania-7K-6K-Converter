@@ -24,9 +24,16 @@ Conversion rules:
      - Columns 1,2,3,5,6,7 (0-indexed: 0,1,2,4,5,6):
          Remap to 6K columns.  Long notes STAY long.
      - Column 4 (0-indexed: 3):
-         * If alone at its timestamp → transfer to the best 6K column
-           (must fall outside all intervals on the target column;
-           the column with the largest min edge-distance wins).
+         * If alone at its timestamp → transfer to the best 6K column.
+           Signed distance to nearest interval edge is computed per column:
+             - T outside interval → positive (distance to nearer edge)
+             - T inside  interval → negative (−distance to nearer edge)
+             - Empty column       → +∞
+           Two aggregates across ALL 6 columns:
+             最小最小值 a = MIN(signed distances): if a < 0, discard
+             (T inside some column's interval → horizontal crowding).
+             最大最小值 b = MAX(signed distances): pick column with b
+             (widest gap → best vertical spacing; b > 0 when a ≥ 0).
          * If company present → discard.
          * Always becomes a normal note (type 1).
      - Columns are remapped: col<3 stay, col>3 shift down by 1.
@@ -223,19 +230,22 @@ def resolve_transfers(transfer_candidates, col_intervals):
       - Normal note at time T   →  [T - MARGIN,  T + MARGIN]
       - Long note from S to E   →  [S - MARGIN,  E + MARGIN]
 
-    For each transfer candidate at time T:
-      1. For each of the 6 target columns, scan all intervals:
-         a. If T is inside *any* interval → column is ineligible (skip).
-         b. Otherwise, compute the distance from T to the nearest
-            interval edge (left edge of the nearest interval to the
-            right, or right edge of the nearest interval to the left).
-            If the column has no intervals at all, distance = ∞.
-      2. Pick the column whose minimum edge-distance is LARGEST — i.e.
-         the column where the note lands in the widest gap.
-      3. When multiple columns share the same maximum min_dist, pick
-         randomly among them.
-      4. If no column is eligible (candidate falls inside intervals on
-         every column), the note is discarded.
+    For each transfer candidate at time T, we compute a *signed* distance
+    from T to the nearest interval edge on each of the 6 target columns:
+      - T is LEFT  of the interval  →  signed_dist = start - T   (> 0)
+      - T is RIGHT of the interval  →  signed_dist = T - end     (> 0)
+      - T is INSIDE the interval    →  signed_dist = -(distance to nearer edge)  (< 0)
+      - Column has no intervals     →  signed_dist = +∞
+
+    Two aggregate metrics across ALL 6 columns:
+      a. 最小最小值 a = MIN(signed_dist across all 6 columns).
+         If a < 0, T falls inside at least one column's interval →
+         the note would cause horizontal crowding; DISCARD it.
+      b. 最大最小值 b = MAX(signed_dist across all 6 columns).
+         When a ≥ 0, T is outside all intervals on all columns, so
+         b > 0 is guaranteed.  The column with signed_dist == b is the
+         one with the widest gap — best vertical spacing (纵向上).
+         When multiple columns tie at b, pick randomly among them.
 
     Resolved notes are always normal notes (type 1), not long notes.
 
@@ -257,44 +267,47 @@ def resolve_transfers(transfer_candidates, col_intervals):
     for obj in transfer_candidates:
         T = obj['time']
         best_cols = []
-        best_min_dist = -1
+        best_min_dist = -1                     # 最大最小值 b (best signed distance)
+        global_min_dist = float('inf')         # 最小最小值 a (worst signed distance)
 
         for col in range(TARGET_KEYS):
             intervals = col_intervals[col]
 
             if not intervals:
                 # Column is completely empty — ideal choice
-                min_dist = float('inf')
+                signed_dist = float('inf')
             else:
-                inside = False
-                min_dist = float('inf')
+                signed_dist = float('inf')
 
                 for start, end in intervals:
                     if start <= T <= end:
-                        # Candidate falls inside this interval → column ineligible
-                        inside = True
-                        break
+                        # T is INSIDE this interval → signed distance is NEGATIVE
+                        # Use the negated distance to the nearer edge
+                        inside_dist = -(min(T - start, end - T))
+                        signed_dist = min(signed_dist, inside_dist)
                     elif T < start:
-                        # Candidate is left of this interval
-                        min_dist = min(min_dist, start - T)
+                        # T is left of this interval
+                        signed_dist = min(signed_dist, start - T)
                     else:  # T > end
-                        # Candidate is right of this interval
-                        min_dist = min(min_dist, T - end)
+                        # T is right of this interval
+                        signed_dist = min(signed_dist, T - end)
 
-                if inside:
-                    continue          # column is ineligible
+            # ---- Track 最小最小值 a (minimum signed distance) ----
+            if signed_dist < global_min_dist:
+                global_min_dist = signed_dist
 
-            if min_dist > best_min_dist:
-                best_min_dist = min_dist
+            # ---- Track 最大最小值 b (maximum signed distance) ----
+            if signed_dist > best_min_dist:
+                best_min_dist = signed_dist
                 best_cols = [col]
-            elif min_dist == best_min_dist:
+            elif signed_dist == best_min_dist:
                 best_cols.append(col)
 
-        # ---- No eligible column → discard ----
-        if not best_cols:
+        # ---- 最小最小值 a < 0 → T falls inside some column's interval → discard ----
+        if global_min_dist < 0:
             continue
 
-        # Pick randomly among the tied best columns
+        # ---- Best column (b > 0 guaranteed since a ≥ 0) ----
         target_col = random.choice(best_cols)
         new_x = get_new_x(target_col)
 

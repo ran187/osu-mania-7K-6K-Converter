@@ -61,7 +61,7 @@ NEW_COMBO_FLAG = 4         # New-combo bit (osu! type field bit 2)
 # A transfer candidate must fall strictly outside all intervals on a
 # column; the edge-distance from the candidate to the nearest interval
 # boundary is then used to rank eligible columns.
-INTERVAL_MARGIN = 250
+INTERVAL_MARGIN = 125
 
 
 # ====================== Helper Functions ======================

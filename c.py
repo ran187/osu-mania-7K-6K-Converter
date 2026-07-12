@@ -220,9 +220,48 @@ def read_groups(hit_object_lines):
 
 # ====================== Transfer Resolution ======================
 
+def can_transfer(t, all_start_times):
+    """
+    Check whether a column-4-alone note at time `t` can be transferred.
+
+    Simplified rule: there must be NO other notes whose start time falls
+    within ±INTERVAL_MARGIN (125 ms) of `t`.
+
+    Uses a global sorted list of all note start times and binary search
+    to answer in O(log N) time.
+
+    Parameters
+    ----------
+    t : int
+        Start time of the transfer candidate.
+    all_start_times : list[int]
+        Sorted list of every note's start time (all columns, including col 4).
+
+    Returns
+    -------
+    bool
+        True if the note can be transferred.
+    """
+    idx = bisect.bisect_left(all_start_times, t)
+
+    # Left neighbour
+    if idx > 0 and t - all_start_times[idx - 1] <= INTERVAL_MARGIN:
+        return False
+
+    # Right neighbour — skip the candidate itself at position idx
+    # (the candidate is alone at time t, so there is exactly one entry at t)
+    if idx + 1 < len(all_start_times) and all_start_times[idx + 1] - t <= INTERVAL_MARGIN:
+        return False
+
+    return True
+
+
 def resolve_transfers(transfer_candidates, col_intervals):
     """
     Resolve column-4-alone notes that must be transferred to another column.
+
+    Eligibility for transfer is decided *before* calling this function
+    (see can_transfer).  This function only chooses the best target column.
 
     Unified interval model
     ----------------------
@@ -237,22 +276,17 @@ def resolve_transfers(transfer_candidates, col_intervals):
       - T is INSIDE the interval    →  signed_dist = -(distance to nearer edge)  (< 0)
       - Column has no intervals     →  signed_dist = +∞
 
-    Two aggregate metrics across ALL 6 columns:
-      a. 最小最小值 a = MIN(signed_dist across all 6 columns).
-         If a < 0, T falls inside at least one column's interval →
-         the note would cause horizontal crowding; DISCARD it.
-      b. 最大最小值 b = MAX(signed_dist across all 6 columns).
-         When a ≥ 0, T is outside all intervals on all columns, so
-         b > 0 is guaranteed.  The column with signed_dist == b is the
-         one with the widest gap — best vertical spacing (纵向上).
-         When multiple columns tie at b, pick randomly among them.
+    The column with the largest signed distance (最大最小值 b) is chosen —
+    it offers the widest gap and therefore the best vertical spacing.
+    When multiple columns tie at b, pick randomly among them.
 
     Resolved notes are always normal notes (type 1), not long notes.
 
     Parameters
     ----------
     transfer_candidates : list[dict]
-        Parsed hit-object dicts needing transfer, already in time order.
+        Parsed hit-object dicts needing transfer, already in time order
+        AND pre-filtered (all candidates are known to be transferable).
     col_intervals : list[list[tuple[int, int]]]
         Six lists of (start, end) intervals, one per 6K column,
         each sorted by start time.
@@ -267,8 +301,7 @@ def resolve_transfers(transfer_candidates, col_intervals):
     for obj in transfer_candidates:
         T = obj['time']
         best_cols = []
-        best_min_dist = -1                     # 最大最小值 b (best signed distance)
-        global_min_dist = float('inf')         # 最小最小值 a (worst signed distance)
+        best_min_dist = -float('inf')           # 最大最小值 b (best signed distance)
 
         for col in range(TARGET_KEYS):
             intervals = col_intervals[col]
@@ -282,7 +315,6 @@ def resolve_transfers(transfer_candidates, col_intervals):
                 for start, end in intervals:
                     if start <= T <= end:
                         # T is INSIDE this interval → signed distance is NEGATIVE
-                        # Use the negated distance to the nearer edge
                         inside_dist = -(min(T - start, end - T))
                         signed_dist = min(signed_dist, inside_dist)
                     elif T < start:
@@ -292,10 +324,6 @@ def resolve_transfers(transfer_candidates, col_intervals):
                         # T is right of this interval
                         signed_dist = min(signed_dist, T - end)
 
-            # ---- Track 最小最小值 a (minimum signed distance) ----
-            if signed_dist < global_min_dist:
-                global_min_dist = signed_dist
-
             # ---- Track 最大最小值 b (maximum signed distance) ----
             if signed_dist > best_min_dist:
                 best_min_dist = signed_dist
@@ -303,11 +331,7 @@ def resolve_transfers(transfer_candidates, col_intervals):
             elif signed_dist == best_min_dist:
                 best_cols.append(col)
 
-        # ---- 最小最小值 a < 0 → T falls inside some column's interval → discard ----
-        if global_min_dist < 0:
-            continue
-
-        # ---- Best column (b > 0 guaranteed since a ≥ 0) ----
+        # ---- Best column ----
         target_col = random.choice(best_cols)
         new_x = get_new_x(target_col)
 
@@ -340,13 +364,15 @@ def convert_hit_objects(hit_object_lines):
           column (sorted by start time) for later transfer resolution.
         - Column-4-alone notes:  pushed to a transfer-candidate list.
         - Column-4-with-company:  silently discarded.
+        - A global sorted list of all note start times is collected for
+          the simplified transfer-eligibility check.
 
-      Phase 2 — Resolve transfers (time order, using resolve_transfers):
-        - For each deferred note, check all 6 columns' intervals.
-          A column is eligible only if the candidate falls outside
-          every interval on that column.  Among eligible columns, pick
-          the one with the largest minimum distance to the nearest
-          interval edge.
+      Phase 2 — Filter & resolve transfers (time order):
+        - Filter transfer candidates with can_transfer: a note at time t
+          is eligible only when NO other note starts within ±125 ms of t.
+          This uses the global start-time list (binary search).
+        - Eligible candidates then go through resolve_transfers to pick
+          the best target column (widest gap to nearest interval edge).
 
       Phase 3 — Merge regular + resolved notes, sort by (time, x),
                 serialise with format_hit_object.
@@ -356,6 +382,10 @@ def convert_hit_objects(hit_object_lines):
     #   normal note at T → (T - MARGIN, T + MARGIN)
     #   long note S..E   → (S - MARGIN, E + MARGIN)
     col_intervals = [[] for _ in range(TARGET_KEYS)]
+
+    # Global sorted list of every note's start time (all columns, incl. col 4).
+    # Used by can_transfer for the simplified eligibility check.
+    all_start_times = []
 
     regular_notes = []          # output-ready dicts (remapped / converted)
     transfer_candidates = []    # column-4-alone notes, already in time order
@@ -375,6 +405,9 @@ def convert_hit_objects(hit_object_lines):
 
         for obj in group:
             col = obj['_col_7k']
+
+            # ---- Record global start time (all notes, all columns) ----
+            bisect.insort(all_start_times, obj['time'])
 
             if col == DELETED_COL:
                 if is_col3_alone:
@@ -411,7 +444,12 @@ def convert_hit_objects(hit_object_lines):
                 col_intervals[new_col].insert(ins_idx, (iv_start, iv_end))
 
     # ---- Phase 2 --------------------------------------------------------
-    resolved_notes = resolve_transfers(transfer_candidates, col_intervals)
+    # Pre-filter: keep only candidates whose ±125 ms neighbourhood is clear
+    eligible_candidates = [
+        obj for obj in transfer_candidates
+        if can_transfer(obj['time'], all_start_times)
+    ]
+    resolved_notes = resolve_transfers(eligible_candidates, col_intervals)
 
     # ---- Phase 3 --------------------------------------------------------
     all_notes = regular_notes + resolved_notes
@@ -440,7 +478,7 @@ def _modify_version(line):
     """Append '_726k_ln' to the Version metadata value."""
     m = re.match(r'(Version\s*:\s*)(.*)', line)
     if m:
-        return f"{m.group(1)}{m.group(2).rstrip()}_726k_ln\n"
+        return f"{m.group(1)}{m.group(2).rstrip()}_726k\n"
     return line
 
 
@@ -578,7 +616,7 @@ def convert_osu_file(osu_path):
     dir_name = os.path.dirname(osu_path)
     base_name = os.path.basename(osu_path)
     stem, ext = os.path.splitext(base_name)
-    new_filename = f"{stem}_[726k_ln]{ext}"
+    new_filename = f"{stem}_[726k]{ext}"
     new_path = os.path.join(dir_name, new_filename)
 
     try:

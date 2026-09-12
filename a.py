@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-osu! Beatmap Download Converter  (Preserve Long Notes)
+osu! Beatmap Download Converter  (Density-Aware Column-4 Transfer)
 ====================================================================
 
 Checks the Downloads folder for .osz beatmap packages, extracts them,
-converts 7K mania beatmaps to 6K using c.py (preserve long notes),
-then re-packages as .osz.
+converts 7K mania beatmaps to 6K using b.py (density-aware column-4
+transfer), then re-packages as .osz.
 
 Each 7K beatmap in the package gets one 6K copy:
-  - _[726k_ln].osu   — non-column-4 long notes preserved (c.py)
+  - _[726k].osu   — column-4 notes kept or dropped by a density check
+    (b.py)
 """
 
 import os
@@ -18,10 +19,10 @@ import tempfile
 import shutil
 import glob
 
-# Import conversion functions from c.py.
+# Import conversion functions from b.py.
 # The module guards main() with "if __name__ == '__main__'", so the import
 # is side-effect-free apart from defining its functions.
-import c
+import b
 
 # ====================== Configuration ======================
 
@@ -39,8 +40,8 @@ def find_osz_files(downloads_dir):
 def process_osz(osz_path):
     """
     Extract *osz_path* to a temporary directory, convert every 7K mania
-    .osu file found inside (c.py style, preserving long notes), then
-    re-pack everything back into the original .osz.
+    .osu file found inside (b.py style, density-aware column-4 transfer),
+    then re-pack everything back into the original .osz.
 
     Returns True if at least one conversion took place, False otherwise.
     """
@@ -62,13 +63,13 @@ def process_osz(osz_path):
                     continue
                 full = os.path.join(root, fname)
 
-                if not c.is_mania_7k(full):
+                if not b.is_mania_7k(full):
                     continue          # not 7K mania — skip
 
-                r_c = c.convert_osu_file(full)
+                r_b = b.convert_osu_file(full)
 
-                if r_c:
-                    print(f"    c.py  →  {os.path.basename(r_c)}")
+                if r_b:
+                    print(f"    b.py  →  {os.path.basename(r_b)}")
                     converted_any = True
 
         if not converted_any:

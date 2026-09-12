@@ -37,7 +37,8 @@ Conversion rules:
      - Column 4 (0-indexed: 3):
          * If company is present at its timestamp → discard.
          * Otherwise apply the density check described above; surviving
-           notes are transferred to the best 6K column (see
+           notes are transferred to the best 6K column, provided its
+           nearest interval edge is at least 62 ms away (see
            resolve_transfers).
          * Always becomes a normal note (type 1).
      - Columns are remapped: col<3 stay, col>3 shift down by 1.
@@ -77,6 +78,13 @@ INTERVAL_MARGIN = 250
 # once 5 or more other notes fall inside the window — a density of
 # roughly 10 notes per second or higher.
 NEARBY_NOTE_LIMIT = 4
+
+# Minimum acceptable gap (ms) between a transferred note and the nearest
+# interval edge on its target column.  After ranking the 6 target
+# columns, the best signed distance (best_min_dist) must be at least
+# this large; otherwise every column is too close to an existing note
+# and the candidate is discarded instead of transferred.
+MIN_TRANSFER_GAP = 125
 
 
 # ====================== Helper Functions ======================
@@ -283,8 +291,12 @@ def resolve_transfers(transfer_candidates, col_intervals):
     """
     Choose a target 6K column for each column-4 transfer candidate.
 
-    Eligibility is decided *before* calling this function (see
-    can_transfer).  This function only picks the destination column.
+    The density eligibility is decided *before* calling this function
+    (see can_transfer).  This function picks the destination column and
+    applies one final check: the best signed distance found across the 6
+    columns (best_min_dist) must be at least MIN_TRANSFER_GAP (62 ms).
+    Candidates whose best gap is smaller than that would land too close
+    to existing notes on every column and are discarded here.
 
     Unified interval model
     ----------------------
@@ -304,7 +316,9 @@ def resolve_transfers(transfer_candidates, col_intervals):
     the other columns as little as possible.  Empty columns (+∞) always
     win, which is how a sparse section lands on an idle column (e.g. the
     100/200/300 ms run goes to column 1/2/6/7).  When several columns
-    tie, one is picked at random.
+    tie, one is picked at random.  If the largest signed distance is
+    below MIN_TRANSFER_GAP (62 ms), every column is too crowded and the
+    candidate is discarded.
 
     Resolved notes are always normal notes (type 1), not long notes.
 
@@ -321,6 +335,7 @@ def resolve_transfers(transfer_candidates, col_intervals):
     -------
     list[dict]
         New note dicts (with correct x for their assigned column).
+        Candidates rejected by the minimum-gap check are omitted.
     """
     resolved = []
 
@@ -356,6 +371,11 @@ def resolve_transfers(transfer_candidates, col_intervals):
                 best_cols = [col]
             elif signed_dist == best_min_dist:
                 best_cols.append(col)
+
+        # ---- Minimum-gap check: if even the best column is closer than
+        #      MIN_TRANSFER_GAP to an existing note, drop the candidate ----
+        if best_min_dist < MIN_TRANSFER_GAP:
+            continue
 
         # ---- Best column ----
         target_col = random.choice(best_cols)

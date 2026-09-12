@@ -1,23 +1,48 @@
 #!/usr/bin/env python3
 """
-osu!mania 7K -> 6K Beatmap Converter 
+osu!mania 7K -> 6K Beatmap Converter (Density-Aware Column-4 Transfer)
 ====================================================================
 
 Converts osu!mania 7-key (7K) beatmaps to 6-key (6K) mode.
 
+Columns 1,2,3,5,6,7 are kept intact and simply remapped (long notes stay
+long); only the 4th column (0-indexed: 3) is ever removed or moved.  A
+column-4 note is discarded outright when another note shares its
+timestamp; otherwise its fate is decided by a density check:
+
+  For each column-4-alone note, count how many other notes start within
+  ±250 ms (a 0.5 s window) of it:
+    * count <= a  (a = NEARBY_NOTE_LIMIT, default 4)
+          → transfer.  The neighbourhood is sparse, so moving the note
+            keeps the original rhythm without disturbing the other
+            columns.
+            Example:  notes on columns 3/4/5 at 100/200/300 ms — the
+            middle note has only 2 neighbours within the window, so it
+            survives and lands on an idle column (1/2/6/7), keeping the
+            alternating-finger run intact.
+    * count > a
+          → discard.  The neighbourhood is dense, so dropping the note
+            protects the hand-feel of the other columns.
+
+With the defaults (a = 4, ±250 ms) a note is dropped once 5 or more
+other notes fall inside its 0.5 s window — i.e. from roughly 10 notes
+per second upwards the chart is considered dense.
+
 Conversion rules:
-  1. Metadata: append "& ssaj" to Creator, append "_726k" to Version,
+  1. Metadata: append "&ssaj" to Creator, append "_726k" to Version,
      set BeatmapID to 0, set CircleSize to 6.
-  2. [HitObjects]: Remove the 4th column (0-indexed: column 3).
-     - If a note on column 4 is alone at its timestamp it is TRANSFERRED.
-       Signed distance to nearest interval edge is computed per column,
-       then two aggregates gate the transfer:
-         a = MIN(signed_dist): if a < 0, discard (horizontal crowding).
-         b = MAX(signed_dist): pick column with b (widest vertical gap).
-     - If column 4 has company it is simply DELETED.
-     - All long notes (type 128) become regular notes (type 1).
+  2. [HitObjects]:
+     - Columns 1,2,3,5,6,7 (0-indexed: 0,1,2,4,5,6):
+         Remap to 6K columns.  Long notes STAY long.
+     - Column 4 (0-indexed: 3):
+         * If company is present at its timestamp → discard.
+         * Otherwise apply the density check described above; surviving
+           notes are transferred to the best 6K column (see
+           resolve_transfers).
+         * Always becomes a normal note (type 1).
      - Columns are remapped: col<3 stay, col>3 shift down by 1.
-  3. A new .osu file is created with "_[726k]" suffix; originals untouched.
+  3. A new .osu file is created with a "_[726k]" suffix; originals
+     untouched.
 """
 
 import bisect
@@ -31,16 +56,27 @@ ORIGINAL_KEYS = 7          # 7K input
 TARGET_KEYS = 6            # 6K output
 DELETED_COL = 3            # 0-indexed column that gets removed (the "4th" column)
 TYPE_NORMAL = 1            # Hit object type for a normal (non-hold) note
-TYPE_NEW_COMBO = 5         # 1 | 4  — normal note with new-combo flag
 TYPE_HOLD = 128            # Bit mask for mania long-note / hold
+NEW_COMBO_FLAG = 4         # New-combo bit (osu! type field bit 2)
 
-# Unified interval margin (ms).
+# Half-width of the interval around every note (ms).
 # Every note on a 6K column is modelled as an interval:
 #   - Normal note at time T  →  [T - MARGIN,  T + MARGIN]
-# A transfer candidate must fall strictly outside all intervals on a
-# column; the signed distance to the nearest interval edge is then used
-# to rank eligible columns.
-INTERVAL_MARGIN = 125
+#   - Long note from S to E  →  [S - MARGIN,  E + MARGIN]
+# Used both by the density check for column-4 candidates (can_transfer)
+# and by the interval model that ranks target columns (resolve_transfers).
+INTERVAL_MARGIN = 250
+
+# Density threshold for the column-4 transfer decision (parameter "a").
+# A column-4-alone note is discarded only when MORE than this many other
+# notes start within ±INTERVAL_MARGIN of it:
+#   - sparse neighbourhood (count <= a) → transfer, preserving rhythm
+#   - dense neighbourhood (count >  a) → discard, protecting the feel of
+#     the other columns
+# With a = 4 and the ±250 ms window (0.5 s total), a note is dropped
+# once 5 or more other notes fall inside the window — a density of
+# roughly 10 notes per second or higher.
+NEARBY_NOTE_LIMIT = 4
 
 
 # ====================== Helper Functions ======================
@@ -54,7 +90,7 @@ def get_column(x, key_count):
     return int(x * key_count / 512)
 
 
-def get_new_x(col, key_count=TARGET_KEYS):      # get_x()
+def get_new_x(col, key_count=TARGET_KEYS):
     """
     Return the x coordinate for the CENTRE of a column in the target key count.
 
@@ -93,12 +129,12 @@ def parse_hit_object(line):
         return None
 
     is_long = bool(obj_type & TYPE_HOLD)        # 128 -> true
-    is_new_combo = bool(obj_type & 4)       # 5 -> true
+    is_new_combo = bool(obj_type & NEW_COMBO_FLAG)  # 4 -> true
     end_time = None
     hit_sample = ''
 
     # Everything after field 5 depends on whether this is a hold note.
-    remainder = ','.join(parts[5:])     # usually remainder == parts[5]
+    remainder = ','.join(parts[5:])     # usually remainder == parts[5] without ,
 
     if is_long:
         # Format: endTime:hitSample
@@ -137,12 +173,31 @@ def format_hit_object(obj, ensure_new_combo=False):
     """
     Serialise a hit-object dict back to a .osu line.
 
-    All output notes are normal (type 1), optionally with the new-combo
-    flag (type 5) when *ensure_new_combo* is True.
+    - Normal notes:  type 1, or 5 when it is the very first note in the
+                     beatmap (ensure_new_combo=True) or originally had
+                     the new-combo flag (is_new_combo=True).
+    - Long notes:    type is ALWAYS 128 — the new-combo flag is never
+                     applied to long notes, even when they are the first
+                     note in the beatmap.
+                     The tail uses "endTime:hitSample" format, matching
+                     the convention seen in mania beatmaps.
     """
-    t = TYPE_NEW_COMBO if (ensure_new_combo or obj.get('is_new_combo')) else TYPE_NORMAL
-    return (f"{obj['x']},{obj['y']},{obj['time']},"
-            f"{t},{obj['hitSound']},{obj['hitSample']}")
+    if obj.get('is_long'):
+        # Long note: type is unconditionally HOLD (128)
+        t = TYPE_HOLD
+    else:
+        # Normal note: type = 1, or 5 if first note / originally had new-combo
+        is_new_combo = ensure_new_combo or obj.get('is_new_combo')
+        t = TYPE_NORMAL | NEW_COMBO_FLAG if is_new_combo else TYPE_NORMAL
+
+    if obj.get('is_long') and obj.get('endTime') is not None:
+        # Long note format: endTime:hitSample
+        return (f"{obj['x']},{obj['y']},{obj['time']},"
+                f"{t},{obj['hitSound']},{obj['endTime']}:{obj['hitSample']}")
+    else:
+        # Normal note format
+        return (f"{obj['x']},{obj['y']},{obj['time']},"
+                f"{t},{obj['hitSound']},{obj['hitSample']}")
 
 
 # ====================== Grouping ======================
@@ -180,38 +235,84 @@ def read_groups(hit_object_lines):
 
 # ====================== Transfer Resolution ======================
 
+def can_transfer(t, all_start_times, limit=NEARBY_NOTE_LIMIT):
+    """
+    Density check: can a column-4-alone note at time `t` be transferred?
+
+    Counts every OTHER note whose start time falls within
+    ±INTERVAL_MARGIN (250 ms, i.e. a 0.5 s window) of `t` and compares
+    that count against the threshold `a` (limit):
+
+      - count <= a  →  True   (neighbourhood sparse → transfer, keep rhythm)
+      - count >  a  →  False  (neighbourhood dense  → discard, keep hand-feel)
+
+    `all_start_times` is a sorted list of every note's start time (all
+    columns, including column 4), so the count is obtained with two
+    binary searches in O(log N) time.
+
+    The candidate is alone at its own timestamp (only column-4-alone
+    notes are ever checked), so exactly one entry in all_start_times
+    belongs to the candidate itself and is subtracted from the count.
+
+    With the default limit = 4 the note is dropped only when 5 or more
+    other notes crowd its 0.5 s window — roughly 10 notes per second or
+    denser.
+
+    Parameters
+    ----------
+    t : int
+        Start time of the transfer candidate.
+    all_start_times : list[int]
+        Sorted list of every note's start time (all columns, including col 4).
+    limit : int
+        The density threshold `a` — maximum tolerated number of nearby
+        notes.  Defaults to NEARBY_NOTE_LIMIT.
+
+    Returns
+    -------
+    bool
+        True if the note can be transferred.
+    """
+    lo = bisect.bisect_left(all_start_times, t - INTERVAL_MARGIN)
+    hi = bisect.bisect_right(all_start_times, t + INTERVAL_MARGIN)
+    nearby = (hi - lo) - 1          # entries within ±INTERVAL_MARGIN, minus the candidate itself
+    return nearby <= limit
+
+
 def resolve_transfers(transfer_candidates, col_intervals):
     """
-    Resolve column-4-alone notes that must be transferred to another column.
+    Choose a target 6K column for each column-4 transfer candidate.
+
+    Eligibility is decided *before* calling this function (see
+    can_transfer).  This function only picks the destination column.
 
     Unified interval model
     ----------------------
     Every non-column-4 note is represented as an interval:
       - Normal note at time T   →  [T - MARGIN,  T + MARGIN]
+      - Long note from S to E   →  [S - MARGIN,  E + MARGIN]
 
-    For each transfer candidate at time T, we compute a *signed* distance
-    from T to the nearest interval edge on each of the 6 target columns:
-      - T is LEFT  of the interval  →  signed_dist = start - T      (> 0)
-      - T is RIGHT of the interval  →  signed_dist = T - end        (> 0)
+    For each candidate at time T, a *signed* distance from T to the
+    nearest interval edge is computed on each of the 6 target columns:
+      - T is LEFT  of the interval  →  signed_dist = start - T   (> 0)
+      - T is RIGHT of the interval  →  signed_dist = T - end     (> 0)
       - T is INSIDE the interval    →  signed_dist = -(distance to nearer edge)  (< 0)
       - Column has no intervals     →  signed_dist = +∞
 
-    Two aggregate metrics across ALL 6 columns:
-      a. 最小最小值 a = MIN(signed_dist across all 6 columns).
-         If a < 0, T falls inside at least one column's interval →
-         the note would cause horizontal crowding; DISCARD it.
-      b. 最大最小值 b = MAX(signed_dist across all 6 columns).
-         When a ≥ 0, T is outside all intervals on all columns, so
-         b > 0 is guaranteed.  The column with signed_dist == b is the
-         one with the widest gap — best vertical spacing.
-         When multiple columns tie at b, pick randomly among them.
+    The column with the largest signed distance is chosen — it has the
+    widest gap to the existing notes, so the transferred note disturbs
+    the other columns as little as possible.  Empty columns (+∞) always
+    win, which is how a sparse section lands on an idle column (e.g. the
+    100/200/300 ms run goes to column 1/2/6/7).  When several columns
+    tie, one is picked at random.
 
     Resolved notes are always normal notes (type 1), not long notes.
 
     Parameters
     ----------
     transfer_candidates : list[dict]
-        Parsed hit-object dicts needing transfer, already in time order.
+        Parsed hit-object dicts needing transfer, already in time order
+        AND pre-filtered (all candidates are known to be transferable).
     col_intervals : list[list[tuple[int, int]]]
         Six lists of (start, end) intervals, one per 6K column,
         each sorted by start time.
@@ -226,8 +327,7 @@ def resolve_transfers(transfer_candidates, col_intervals):
     for obj in transfer_candidates:
         T = obj['time']
         best_cols = []
-        best_min_dist = -1                     # 最大最小值 b (best signed distance)
-        global_min_dist = float('inf')         # 最小最小值 a (worst signed distance)
+        best_min_dist = -float('inf')           # best signed distance seen so far
 
         for col in range(TARGET_KEYS):
             intervals = col_intervals[col]
@@ -250,22 +350,14 @@ def resolve_transfers(transfer_candidates, col_intervals):
                         # T is right of this interval
                         signed_dist = min(signed_dist, T - end)
 
-            # ---- Track 最小最小值 a (minimum signed distance) ----
-            if signed_dist < global_min_dist:
-                global_min_dist = signed_dist
-
-            # ---- Track 最大最小值 b (maximum signed distance) ----
+            # ---- Track the maximum signed distance across columns ----
             if signed_dist > best_min_dist:
                 best_min_dist = signed_dist
                 best_cols = [col]
             elif signed_dist == best_min_dist:
                 best_cols.append(col)
 
-        # ---- 最小最小值 a < 0 → T falls inside some column's interval → discard ----
-        if global_min_dist < 0:
-            continue
-
-        # ---- Best column (b > 0 guaranteed since a ≥ 0) ----
+        # ---- Best column ----
         target_col = random.choice(best_cols)
         new_x = get_new_x(target_col)
 
@@ -276,6 +368,8 @@ def resolve_transfers(transfer_candidates, col_intervals):
             'hitSound': obj['hitSound'],
             'hitSample': obj['hitSample'],
             'is_new_combo': obj['is_new_combo'],
+            'is_long': False,           # column-4 notes always become normal
+            'endTime': None,
         }
         resolved.append(new_obj)
 
@@ -291,25 +385,35 @@ def convert_hit_objects(hit_object_lines):
     Three-phase algorithm:
 
       Phase 1 — Single pass over groups (time order):
-        - Non-column-4 notes: remap column & x, convert long→normal,
+        - Non-column-4 notes: remap column & x, PRESERVE long notes,
           add to the output pool.  Build a unified interval list per
           column (sorted by start time) for later transfer resolution.
         - Column-4-alone notes:  pushed to a transfer-candidate list.
         - Column-4-with-company:  silently discarded.
+        - A global sorted list of all note start times is collected for
+          the density-based transfer-eligibility check.
 
-      Phase 2 — Resolve transfers (time order, using resolve_transfers):
-        - For each deferred note, check all 6 columns' intervals.
-          Signed distance is computed per column (positive = T outside,
-          negative = T inside, +∞ = empty).  Two aggregates:
-            a = MIN(signed_dist): if a < 0, discard (horizontal crowding).
-            b = MAX(signed_dist): pick column with b (best vertical gap).
+      Phase 2 — Density filter & resolve transfers (time order):
+        - Filter transfer candidates with can_transfer: a note at time t
+          survives only when at most `a` other notes start within ±250 ms
+          of t (a 0.5 s window, a = NEARBY_NOTE_LIMIT).
+          This uses the global start-time list (binary search).
+        - Surviving candidates then go through resolve_transfers to pick
+          the best target column (widest gap to the nearest interval
+          edge).
 
       Phase 3 — Merge regular + resolved notes, sort by (time, x),
                 serialise with format_hit_object.
     """
     # Per-column unified intervals — sorted by start time
-    # Each interval is (T - MARGIN, T + MARGIN) for a normal note at T.
+    # Each interval is (start, end) where:
+    #   normal note at T → (T - MARGIN, T + MARGIN)
+    #   long note S..E   → (S - MARGIN, E + MARGIN)
     col_intervals = [[] for _ in range(TARGET_KEYS)]
+
+    # Global sorted list of every note's start time (all columns, incl. col 4).
+    # Used by can_transfer for the neighbourhood density check.
+    all_start_times = []
 
     regular_notes = []          # output-ready dicts (remapped / converted)
     transfer_candidates = []    # column-4-alone notes, already in time order
@@ -330,6 +434,9 @@ def convert_hit_objects(hit_object_lines):
         for obj in group:
             col = obj['_col_7k']
 
+            # ---- Record global start time (all notes, all columns) ----
+            bisect.insort(all_start_times, obj['time'])
+
             if col == DELETED_COL:
                 if is_col3_alone:
                     transfer_candidates.append(obj)
@@ -346,12 +453,18 @@ def convert_hit_objects(hit_object_lines):
                     'hitSound': obj['hitSound'],
                     'hitSample': obj['hitSample'],
                     'is_new_combo': obj['is_new_combo'],
+                    'is_long': obj['is_long'],          # preserve long notes
+                    'endTime': obj['endTime'],          # preserve end time
                 }
                 regular_notes.append(new_obj)
 
-                # ---- Build interval ----
-                iv_start = obj['time'] - INTERVAL_MARGIN
-                iv_end = obj['time'] + INTERVAL_MARGIN
+                # ---- Build unified interval ----
+                if obj['is_long'] and obj['endTime'] is not None:
+                    iv_start = obj['time'] - INTERVAL_MARGIN
+                    iv_end = obj['endTime'] + INTERVAL_MARGIN
+                else:
+                    iv_start = obj['time'] - INTERVAL_MARGIN
+                    iv_end = obj['time'] + INTERVAL_MARGIN
 
                 # Insert sorted by start time
                 ins_idx = bisect.bisect_left(
@@ -359,7 +472,13 @@ def convert_hit_objects(hit_object_lines):
                 col_intervals[new_col].insert(ins_idx, (iv_start, iv_end))
 
     # ---- Phase 2 --------------------------------------------------------
-    resolved_notes = resolve_transfers(transfer_candidates, col_intervals)
+    # Density filter: a candidate survives only when at most `a` other
+    # notes start within ±250 ms of it (a 0.5 s window, a = NEARBY_NOTE_LIMIT).
+    eligible_candidates = [
+        obj for obj in transfer_candidates
+        if can_transfer(obj['time'], all_start_times)
+    ]
+    resolved_notes = resolve_transfers(eligible_candidates, col_intervals)
 
     # ---- Phase 3 --------------------------------------------------------
     all_notes = regular_notes + resolved_notes
@@ -377,10 +496,10 @@ def convert_hit_objects(hit_object_lines):
 # ====================== File-Level Conversion ======================
 
 def _modify_creator(line):
-    """Append '& ssaj' to the Creator metadata value."""
+    """Append '&ssaj' to the Creator metadata value."""
     m = re.match(r'(Creator\s*:\s*)(.*)', line)
     if m:
-        return f"{m.group(1)}{m.group(2).rstrip()}& ssaj\n"
+        return f"{m.group(1)}{m.group(2).rstrip()}&ssaj\n"
     return line
 
 
@@ -423,13 +542,12 @@ def is_mania_7k(osu_path):
                 stripped = line.strip()
 
                 # ---- Section headers ----
-                # Once we pass [HitObjects]) we can stop 
+                # Once we pass [HitObjects] we can stop
                 if stripped == '[HitObjects]':
                     break
 
                 # ---- Mode (in [General]) ----
                 if mode is None and stripped.startswith('Mode:'):
-                    # e.g. "Mode: 3"
                     try:
                         mode = int(stripped.split(':')[1].strip())
                     except ValueError:
@@ -635,6 +753,7 @@ def batch_convert():
 def main():
     print("=" * 50)
     print("   osu!mania  7K  -->  6K  Beatmap Converter")
+    print(f"   (Density-Aware Transfer, a={NEARBY_NOTE_LIMIT})")
     print("=" * 50)
 
     batch_convert()

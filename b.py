@@ -1,49 +1,33 @@
 #!/usr/bin/env python3
 """
-osu!mania 7K -> 6K Beatmap Converter (Density-Aware Column-4 Transfer)
-====================================================================
+osu!mania 7K → 6K 谱面转换器（密度感知的第 4 列转移）
+====================================================
 
-Converts osu!mania 7-key (7K) beatmaps to 6-key (6K) mode.
+将 7K 谱面转换为 6K。第 1/2/3/5/6/7 列直接重映射并保留
+（长条保持长条）；只有第 4 列（0 基索引 3）会被移除或转移：
 
-Columns 1,2,3,5,6,7 are kept intact and simply remapped (long notes stay
-long); only the 4th column (0-indexed: 3) is ever removed or moved.  A
-column-4 note is discarded outright when another note shares its
-timestamp; otherwise its fate is decided by a density check:
+- 与其它音符同时间出现 → 直接丢弃
+- 单独出现 → 密度检查：统计 ±250 ms（0.5 s 窗口）内起始的
+  其它音符数
+  - 数量 ≤ a（NEARBY_NOTE_LIMIT，默认 6）→ 进入间距检查
+  - 数量 > a → 丢弃：附近密集，丢弃以保护其它列的手感
+  （±250 ms 窗口内出现 7 个以上其它音符，即约每秒 14 个
+  音符以上，视为密集）
+- 通过密度检查 → 间距检查：分别求 K 到 6 个目标列最近按键的
+  距离（普通音符为点，长条为其起止区间），取 6 列最大值 d；
+  d ≥ MIN_TRANSFER_GAP（125 ms）才转移，否则丢弃
 
-  For each column-4-alone note, count how many other notes start within
-  ±250 ms (a 0.5 s window) of it:
-    * count <= a  (a = NEARBY_NOTE_LIMIT, default 4)
-          → transfer.  The neighbourhood is sparse, so moving the note
-            keeps the original rhythm without disturbing the other
-            columns.
-            Example:  notes on columns 3/4/5 at 100/200/300 ms — the
-            middle note has only 2 neighbours within the window, so it
-            survives and lands on an idle column (1/2/6/7), keeping the
-            alternating-finger run intact.
-    * count > a
-          → discard.  The neighbourhood is dense, so dropping the note
-            protects the hand-feel of the other columns.
-
-With the defaults (a = 4, ±250 ms) a note is dropped once 5 or more
-other notes fall inside its 0.5 s window — i.e. from roughly 10 notes
-per second upwards the chart is considered dense.
-
-Conversion rules:
-  1. Metadata: append "&ssaj" to Creator, append "_726k" to Version,
-     set BeatmapID to 0, set CircleSize to 6.
-  2. [HitObjects]:
-     - Columns 1,2,3,5,6,7 (0-indexed: 0,1,2,4,5,6):
-         Remap to 6K columns.  Long notes STAY long.
-     - Column 4 (0-indexed: 3):
-         * If company is present at its timestamp → discard.
-         * Otherwise apply the density check described above; surviving
-           notes are transferred to the best 6K column, provided its
-           nearest interval edge is at least 62 ms away (see
-           resolve_transfers).
-         * Always becomes a normal note (type 1).
-     - Columns are remapped: col<3 stay, col>3 shift down by 1.
-  3. A new .osu file is created with a "_[726k]" suffix; originals
-     untouched.
+转换规则：
+  1. 元数据：Creator 追加 "&ssaj"，Version 追加 "_726k"，
+     BeatmapID 置 0，CircleSize 置 6。
+  2. [HitObjects]：
+     - 列 1/2/3/5/6/7（0 基：0,1,2,4,5,6）：重映射到 6K 列
+       （列 < 3 不动，列 > 3 减 1），长条保持长条。
+     - 列 4（0 基：3）：按上述规则转移或丢弃；转移目标为 6 列
+       中最近按键距离最大、且 d ≥ MIN_TRANSFER_GAP 的列
+       （并列按固定种子随机，见 resolve_transfers）；一律变为
+       普通音符。
+  3. 输出新 .osu 文件，文件名加 "_[726k]" 后缀；原文件不动。
 """
 
 import bisect
@@ -51,80 +35,64 @@ import os
 import random
 import re
 
-# ====================== Constants ======================
+# ====================== 常量 ======================
 
-ORIGINAL_KEYS = 7          # 7K input
-TARGET_KEYS = 6            # 6K output
-DELETED_COL = 3            # 0-indexed column that gets removed (the "4th" column)
-TYPE_NORMAL = 1            # Hit object type for a normal (non-hold) note
-TYPE_HOLD = 128            # Bit mask for mania long-note / hold
-NEW_COMBO_FLAG = 4         # New-combo bit (osu! type field bit 2)
+ORIGINAL_KEYS = 7          # 输入 7K
+TARGET_KEYS = 6            # 输出 6K
+DELETED_COL = 3            # 被移除的列（0 基索引，即"第 4 列"）
+TYPE_NORMAL = 1            # 普通音符的 type
+TYPE_HOLD = 128            # mania 长条掩码
+NEW_COMBO_FLAG = 4         # new-combo 标志位（type 字段第 2 位）
 
-# Half-width of the interval around every note (ms).
-# Every note on a 6K column is modelled as an interval:
-#   - Normal note at time T  →  [T - MARGIN,  T + MARGIN]
-#   - Long note from S to E  →  [S - MARGIN,  E + MARGIN]
-# Used both by the density check for column-4 candidates (can_transfer)
-# and by the interval model that ranks target columns (resolve_transfers).
-INTERVAL_MARGIN = 250
+# 密度检查窗口的半宽（ms）：统计第 4 列单独音符 K 在
+# ±DENSITY_WINDOW（0.5 s 窗口）内起始的其它音符数（can_transfer）。
+DENSITY_WINDOW = 250
 
-# Density threshold for the column-4 transfer decision (parameter "a").
-# A column-4-alone note is discarded only when MORE than this many other
-# notes start within ±INTERVAL_MARGIN of it:
-#   - sparse neighbourhood (count <= a) → transfer, preserving rhythm
-#   - dense neighbourhood (count >  a) → discard, protecting the feel of
-#     the other columns
-# With a = 4 and the ±250 ms window (0.5 s total), a note is dropped
-# once 5 or more other notes fall inside the window — a density of
-# roughly 10 notes per second or higher.
-NEARBY_NOTE_LIMIT = 4
+# 密度阈值（参数 a）：第 4 列单独音符在 ±DENSITY_WINDOW 窗口内
+# 起始的其它音符超过该数量时丢弃，否则进入间距检查。
+# 实际测试把这个值设为6，调得越大，转谱的结果越卡手
+# 如果设置成-1，结果等于“直接删除第4轨道"
+NEARBY_NOTE_LIMIT = 6   
 
-# Minimum acceptable gap (ms) between a transferred note and the nearest
-# interval edge on its target column.  After ranking the 6 target
-# columns, the best signed distance (best_min_dist) must be at least
-# this large; otherwise every column is too close to an existing note
-# and the candidate is discarded instead of transferred.
+# 间距阈值（ms）：K 到 6 个目标列各自最近按键的距离（到点或
+# 区间）取最大值 d，d 仍小于该值 → 所有列都太挤，放弃转移。
 MIN_TRANSFER_GAP = 125
 
+# 并列选择用的固定随机种子：保证同一谱面重复转换时并列选择
+# 结果一致，两次生成的谱面完全相同。
+RANDOM_SEED = 114514
 
-# ====================== Helper Functions ======================
+
+# ====================== 辅助函数 ======================
 
 def get_column(x, key_count):
-    """
-    Return the 0-indexed column number from an x coordinate.
-
-    Formula from the osu! spec:  column = floor(x * keyCount / 512)
-    """
+    """由 x 坐标求 0 基列号（osu! 规范：floor(x * keyCount / 512)）。"""
     return int(x * key_count / 512)
 
 
 def get_new_x(col, key_count=TARGET_KEYS):
-    """
-    Return the x coordinate for the CENTRE of a column in the target key count.
-
-    x = floor((col + 0.5) * 512 / key_count)
-    """
+    """目标键数下某列中心的 x 坐标：floor((col + 0.5) * 512 / key_count)。"""
     return int((col + 0.5) * 512 / key_count)
 
 
-# ====================== Hit Object Parsing ======================
+# ====================== HitObject 解析 ======================
 
 def parse_hit_object(line):
     """
-    Parse a single [HitObjects] line.
+    解析一行 [HitObjects]。
 
-    Two formats are handled:
-      - Normal : x, y, time, type, hitSound, hitSample
-      - Hold   : x, y, time, type, hitSound, endTime:hitSample
+    支持两种格式：
+      - 普通：x, y, time, type, hitSound, hitSample
+      - 长条：x, y, time, type, hitSound, endTime:hitSample
 
-    Returns a dict, or None if the line is invalid.
+    返回 dict；无效行返回 None。
     """
     line = line.strip()
     if not line:
         return None
 
     parts = line.split(',')
-    if len(parts) < 5:      # at least x,y,time,type,hitsound
+    if len(parts) < 5:      # 至少 x,y,time,type,hitsound
         return None
 
     try:
@@ -136,16 +104,16 @@ def parse_hit_object(line):
     except ValueError:
         return None
 
-    is_long = bool(obj_type & TYPE_HOLD)        # 128 -> true
-    is_new_combo = bool(obj_type & NEW_COMBO_FLAG)  # 4 -> true
+    is_long = bool(obj_type & TYPE_HOLD)               # 含 128 位 → 长条
+    is_new_combo = bool(obj_type & NEW_COMBO_FLAG)     # 含 4 位 → new-combo
     end_time = None
     hit_sample = ''
 
-    # Everything after field 5 depends on whether this is a hold note.
-    remainder = ','.join(parts[5:])     # usually remainder == parts[5] without ,
+    # 第 6 个字段起的内容取决于是否为长条
+    remainder = ','.join(parts[5:])
 
     if is_long:
-        # Format: endTime:hitSample
+        # 长条格式：endTime:hitSample
         colon_idx = remainder.find(':')
         if colon_idx != -1:
             try:
@@ -154,14 +122,14 @@ def parse_hit_object(line):
                 end_time = 0
             hit_sample = remainder[colon_idx + 1:]
         else:
-            # Degenerate case — treat entire remainder as endTime
+            # 无冒号的退化情况：整个 remainder 当作 endTime
             try:
                 end_time = int(remainder)
             except ValueError:
                 end_time = 0
             hit_sample = ''
     else:
-        # Normal note — the remainder IS the hitSample
+        # 普通音符：remainder 就是 hitSample
         hit_sample = remainder
 
     return {
@@ -179,45 +147,39 @@ def parse_hit_object(line):
 
 def format_hit_object(obj, ensure_new_combo=False):
     """
-    Serialise a hit-object dict back to a .osu line.
+    把音符 dict 序列化回 .osu 行。
 
-    - Normal notes:  type 1, or 5 when it is the very first note in the
-                     beatmap (ensure_new_combo=True) or originally had
-                     the new-combo flag (is_new_combo=True).
-    - Long notes:    type is ALWAYS 128 — the new-combo flag is never
-                     applied to long notes, even when they are the first
-                     note in the beatmap.
-                     The tail uses "endTime:hitSample" format, matching
-                     the convention seen in mania beatmaps.
+    - 普通音符：type 为 1；若为谱面第一个音符（ensure_new_combo）
+      或原有 new-combo 标志则为 5。
+    - 长条：type 恒为 128，不应用 new-combo（即使是第一个音符）；
+      尾部用 "endTime:hitSample" 格式（mania 谱面惯例）。
     """
     if obj.get('is_long'):
-        # Long note: type is unconditionally HOLD (128)
+        # 长条：type 恒为 128
         t = TYPE_HOLD
     else:
-        # Normal note: type = 1, or 5 if first note / originally had new-combo
+        # 普通音符：首个音符或原有 new-combo 时为 5
         is_new_combo = ensure_new_combo or obj.get('is_new_combo')
         t = TYPE_NORMAL | NEW_COMBO_FLAG if is_new_combo else TYPE_NORMAL
 
     if obj.get('is_long') and obj.get('endTime') is not None:
-        # Long note format: endTime:hitSample
+        # 长条：endTime:hitSample
         return (f"{obj['x']},{obj['y']},{obj['time']},"
                 f"{t},{obj['hitSound']},{obj['endTime']}:{obj['hitSample']}")
     else:
-        # Normal note format
+        # 普通音符
         return (f"{obj['x']},{obj['y']},{obj['time']},"
                 f"{t},{obj['hitSound']},{obj['hitSample']}")
 
 
-# ====================== Grouping ======================
+# ====================== 分组 ======================
 
 def read_groups(hit_object_lines):
     """
-    Yield groups of hit objects that share the same start time.
+    按起始时间分组产出音符。
 
-    Each element:  (time_in_ms, [list_of_parsed_obj_dicts])
-
-    Because [HitObjects] are sorted by time we can simply compare
-    consecutive lines.
+    每个元素：(time_in_ms, [音符 dict 列表])
+    [HitObjects] 按时间排序，故只需比较相邻行。
     """
     current_time = None
     current_group = []
@@ -241,144 +203,112 @@ def read_groups(hit_object_lines):
         yield (current_time, current_group)
 
 
-# ====================== Transfer Resolution ======================
+# ====================== 转移解析 ======================
 
 def can_transfer(t, all_start_times, limit=NEARBY_NOTE_LIMIT):
     """
-    Density check: can a column-4-alone note at time `t` be transferred?
+    密度检查：第 4 列单独音符（时间 t）能否转移？
 
-    Counts every OTHER note whose start time falls within
-    ±INTERVAL_MARGIN (250 ms, i.e. a 0.5 s window) of `t` and compares
-    that count against the threshold `a` (limit):
+    统计 ±DENSITY_WINDOW（0.5 s 窗口）内其它音符的起始数：
+      - count ≤ limit → True（稀疏 → 进入间距检查）
+      - count > limit → False（密集 → 丢弃，保护手感）
 
-      - count <= a  →  True   (neighbourhood sparse → transfer, keep rhythm)
-      - count >  a  →  False  (neighbourhood dense  → discard, keep hand-feel)
-
-    `all_start_times` is a sorted list of every note's start time (all
-    columns, including column 4), so the count is obtained with two
-    binary searches in O(log N) time.
-
-    The candidate is alone at its own timestamp (only column-4-alone
-    notes are ever checked), so exactly one entry in all_start_times
-    belongs to the candidate itself and is subtracted from the count.
-
-    With the default limit = 4 the note is dropped only when 5 or more
-    other notes crowd its 0.5 s window — roughly 10 notes per second or
-    denser.
-
-    Parameters
-    ----------
-    t : int
-        Start time of the transfer candidate.
-    all_start_times : list[int]
-        Sorted list of every note's start time (all columns, including col 4).
-    limit : int
-        The density threshold `a` — maximum tolerated number of nearby
-        notes.  Defaults to NEARBY_NOTE_LIMIT.
-
-    Returns
-    -------
-    bool
-        True if the note can be transferred.
+    all_start_times 为全体音符起始时间的有序列表（含第 4 列），
+    两次二分查找即可得窗口内数量（O(log N)）。候选音符在其时间
+    点上仅此一个，故计数减 1。
     """
-    lo = bisect.bisect_left(all_start_times, t - INTERVAL_MARGIN)
-    hi = bisect.bisect_right(all_start_times, t + INTERVAL_MARGIN)
-    nearby = (hi - lo) - 1          # entries within ±INTERVAL_MARGIN, minus the candidate itself
+    lo = bisect.bisect_left(all_start_times, t - DENSITY_WINDOW)
+    hi = bisect.bisect_right(all_start_times, t + DENSITY_WINDOW)
+    nearby = (hi - lo) - 1          # 窗口内音符数减去候选自身
     return nearby <= limit
 
 
-def resolve_transfers(transfer_candidates, col_intervals):
+def resolve_transfers(transfer_candidates, col_spans, rng=None):
     """
-    Choose a target 6K column for each column-4 transfer candidate.
+    为每个通过密度检查的候选挑选目标 6K 列。
 
-    The density eligibility is decided *before* calling this function
-    (see can_transfer).  This function picks the destination column and
-    applies one final check: the best signed distance found across the 6
-    columns (best_min_dist) must be at least MIN_TRANSFER_GAP (62 ms).
-    Candidates whose best gap is smaller than that would land too close
-    to existing notes on every column and are discarded here.
+    密度资格已在调用前由 can_transfer 判定；本函数做间距检查并
+    选目标列：6 列中 K 到最近按键距离的最大值 d 必须
+    ≥ MIN_TRANSFER_GAP，否则候选在所有列上都离已有按键太近，
+    丢弃。
 
-    Unified interval model
-    ----------------------
-    Every non-column-4 note is represented as an interval:
-      - Normal note at time T   →  [T - MARGIN,  T + MARGIN]
-      - Long note from S to E   →  [S - MARGIN,  E + MARGIN]
+    点 / 区间模型
+    -------------
+    每个非第 4 列音符是一个点或区间：
+      - 普通音符 T   → 点 T
+      - 长条 S..E    → 区间 [S, E]
 
-    For each candidate at time T, a *signed* distance from T to the
-    nearest interval edge is computed on each of the 6 target columns:
-      - T is LEFT  of the interval  →  signed_dist = start - T   (> 0)
-      - T is RIGHT of the interval  →  signed_dist = T - end     (> 0)
-      - T is INSIDE the interval    →  signed_dist = -(distance to nearer edge)  (< 0)
-      - Column has no intervals     →  signed_dist = +∞
+    对候选时间 T，在 6 个目标列上分别计算 T 到最近按键的距离：
+      - T 在区间内（含端点）→ 0
+      - T 在点/区间左侧      → start - T
+      - T 在点/区间右侧      → T - end
+      - 列为空               → +∞
 
-    The column with the largest signed distance is chosen — it has the
-    widest gap to the existing notes, so the transferred note disturbs
-    the other columns as little as possible.  Empty columns (+∞) always
-    win, which is how a sparse section lands on an idle column (e.g. the
-    100/200/300 ms run goes to column 1/2/6/7).  When several columns
-    tie, one is picked at random.  If the largest signed distance is
-    below MIN_TRANSFER_GAP (62 ms), every column is too crowded and the
-    candidate is discarded.
+    取 6 列距离的最大值 d（空隙最大，对其它列打扰最小）；空列
+    （+∞）恒胜，因此稀疏段会落到空闲列上。并列时按固定种子随机
+    选一列（同一谱面多次转换结果一致；rng 未传入时退回模块级
+    random）。若 d < MIN_TRANSFER_GAP，所有列都太挤，丢弃候选。
+    转移后的音符一律为普通音符（type 1）。
 
-    Resolved notes are always normal notes (type 1), not long notes.
-
-    Parameters
-    ----------
-    transfer_candidates : list[dict]
-        Parsed hit-object dicts needing transfer, already in time order
-        AND pre-filtered (all candidates are known to be transferable).
-    col_intervals : list[list[tuple[int, int]]]
-        Six lists of (start, end) intervals, one per 6K column,
-        each sorted by start time.
-
-    Returns
-    -------
-    list[dict]
-        New note dicts (with correct x for their assigned column).
-        Candidates rejected by the minimum-gap check are omitted.
+    返回新音符 dict 列表（含目标列的 x 坐标）；未通过间距检查
+    的候选被省略。
     """
+    if rng is None:
+        rng = random                  # 未显式传入时退回模块级随机源
+
+    # 每列按起点有序的点/区间表，以及"前 i 项 end 的最大值"前缀表
+    col_starts = [[s for s, _ in spans] for spans in col_spans]
+    col_end_prefix = []
+    for spans in col_spans:
+        prefix = []
+        best_end = -float('inf')
+        for _s, e in spans:
+            best_end = max(best_end, e)
+            prefix.append(best_end)
+        col_end_prefix.append(prefix)
+
     resolved = []
 
     for obj in transfer_candidates:
         T = obj['time']
         best_cols = []
-        best_min_dist = -float('inf')           # best signed distance seen so far
+        best_d = -1.0                   # 迄今各列最近距离的最大值（≥ 0）
 
         for col in range(TARGET_KEYS):
-            intervals = col_intervals[col]
+            starts = col_starts[col]
 
-            if not intervals:
-                # Column is completely empty — ideal choice
-                signed_dist = float('inf')
+            if not starts:
+                # 空列 —— 理想选择
+                d = float('inf')
             else:
-                signed_dist = float('inf')
+                idx = bisect.bisect_right(starts, T)
 
-                for start, end in intervals:
-                    if start <= T <= end:
-                        # T is INSIDE this interval → signed distance is NEGATIVE
-                        inside_dist = -(min(T - start, end - T))
-                        signed_dist = min(signed_dist, inside_dist)
-                    elif T < start:
-                        # T is left of this interval
-                        signed_dist = min(signed_dist, start - T)
-                    else:  # T > end
-                        # T is right of this interval
-                        signed_dist = min(signed_dist, T - end)
+                # T 之后最近的按键
+                d_left = starts[idx] - T if idx < len(starts) else float('inf')
 
-            # ---- Track the maximum signed distance across columns ----
-            if signed_dist > best_min_dist:
-                best_min_dist = signed_dist
+                # T 之前（含）开始的点/区间：若某区间覆盖 T 则距离为 0，
+                # 否则最近距离为 T 减这些项的最大 end
+                if idx > 0:
+                    max_end = col_end_prefix[col][idx - 1]
+                    d_right = 0.0 if max_end >= T else T - max_end
+                else:
+                    d_right = float('inf')
+
+                d = min(d_left, d_right)
+
+            # ---- 记录跨列的最大最近距离 ----
+            if d > best_d:
+                best_d = d
                 best_cols = [col]
-            elif signed_dist == best_min_dist:
+            elif d == best_d:
                 best_cols.append(col)
 
-        # ---- Minimum-gap check: if even the best column is closer than
-        #      MIN_TRANSFER_GAP to an existing note, drop the candidate ----
-        if best_min_dist < MIN_TRANSFER_GAP:
+        # ---- 间距检查：最佳列仍比 MIN_TRANSFER_GAP 更近 → 丢弃 ----
+        if best_d < MIN_TRANSFER_GAP:
             continue
 
-        # ---- Best column ----
-        target_col = random.choice(best_cols)
+        # ---- 选定目标列 ----
+        target_col = rng.choice(best_cols)
         new_x = get_new_x(target_col)
 
         new_obj = {
@@ -388,7 +318,7 @@ def resolve_transfers(transfer_candidates, col_intervals):
             'hitSound': obj['hitSound'],
             'hitSample': obj['hitSample'],
             'is_new_combo': obj['is_new_combo'],
-            'is_long': False,           # column-4 notes always become normal
+            'is_long': False,           # 第 4 列音符一律变普通音符
             'endTime': None,
         }
         resolved.append(new_obj)
@@ -396,52 +326,45 @@ def resolve_transfers(transfer_candidates, col_intervals):
     return resolved
 
 
-# ====================== Conversion Core ======================
+# ====================== 转换核心 ======================
 
 def convert_hit_objects(hit_object_lines):
     """
-    Convert the [HitObjects] block from 7K to 6K.
+    将 [HitObjects] 段从 7K 转 6K。三阶段算法：
 
-    Three-phase algorithm:
+      阶段 1 — 按时间顺序单遍扫描各分组：
+        - 非第 4 列：重映射列与 x，长条保留，加入输出池；
+          同时按列构建点/区间表（普通音符为点、长条为起止
+          区间，供间距检查用）
+        - 第 4 列单独：加入转移候选
+        - 第 4 列有伴：静默丢弃
+        - 收集全体音符起始时间的有序表（供密度检查二分查找）
 
-      Phase 1 — Single pass over groups (time order):
-        - Non-column-4 notes: remap column & x, PRESERVE long notes,
-          add to the output pool.  Build a unified interval list per
-          column (sorted by start time) for later transfer resolution.
-        - Column-4-alone notes:  pushed to a transfer-candidate list.
-        - Column-4-with-company:  silently discarded.
-        - A global sorted list of all note start times is collected for
-          the density-based transfer-eligibility check.
+      阶段 2 — 密度过滤并解析转移（按时间序）：
+        - can_transfer 过滤：±250 ms 窗口内起始的其它音符 ≤ a
+          （a = NEARBY_NOTE_LIMIT）才保留
+        - 幸存候选交给 resolve_transfers：K 到各列最近按键
+          距离的最大值 d ≥ MIN_TRANSFER_GAP 才转移，目标列为
+          d 所在列（并列随机）
 
-      Phase 2 — Density filter & resolve transfers (time order):
-        - Filter transfer candidates with can_transfer: a note at time t
-          survives only when at most `a` other notes start within ±250 ms
-          of t (a 0.5 s window, a = NEARBY_NOTE_LIMIT).
-          This uses the global start-time list (binary search).
-        - Surviving candidates then go through resolve_transfers to pick
-          the best target column (widest gap to the nearest interval
-          edge).
-
-      Phase 3 — Merge regular + resolved notes, sort by (time, x),
-                serialise with format_hit_object.
+      阶段 3 — 合并常规与转移音符，按 (time, x) 排序，
+               用 format_hit_object 序列化。
     """
-    # Per-column unified intervals — sorted by start time
-    # Each interval is (start, end) where:
-    #   normal note at T → (T - MARGIN, T + MARGIN)
-    #   long note S..E   → (S - MARGIN, E + MARGIN)
-    col_intervals = [[] for _ in range(TARGET_KEYS)]
+    # 各列音符点/区间表（按起点排序）：
+    #   普通音符 T → (T, T)
+    #   长条 S..E  → (S, E)
+    col_spans = [[] for _ in range(TARGET_KEYS)]
 
-    # Global sorted list of every note's start time (all columns, incl. col 4).
-    # Used by can_transfer for the neighbourhood density check.
+    # 全体音符起始时间的有序表（含第 4 列），供密度检查二分查找
     all_start_times = []
 
-    regular_notes = []          # output-ready dicts (remapped / converted)
-    transfer_candidates = []    # column-4-alone notes, already in time order
+    regular_notes = []          # 直接重映射的输出音符
+    transfer_candidates = []    # 第 4 列单独音符（已按时间序）
 
-    # ---- Phase 1 --------------------------------------------------------
+    # ---- 阶段 1 --------------------------------------------------------
     for _time, group in read_groups(hit_object_lines):
 
-        # Annotate each object with its 7K column
+        # 标注每个音符的 7K 列号
         cols_7k = set()
         for obj in group:
             c = get_column(obj['x'], ORIGINAL_KEYS)
@@ -454,15 +377,15 @@ def convert_hit_objects(hit_object_lines):
         for obj in group:
             col = obj['_col_7k']
 
-            # ---- Record global start time (all notes, all columns) ----
+            # ---- 记录全局起始时间 ----
             bisect.insort(all_start_times, obj['time'])
 
             if col == DELETED_COL:
                 if is_col3_alone:
                     transfer_candidates.append(obj)
-                # else: col 3 has company → discard
+                # else: 第 4 列有伴 → 丢弃
             else:
-                # Remap column
+                # 重映射：列 < 3 不动，列 > 3 减 1
                 new_col = col - 1 if col > DELETED_COL else col
                 new_x = get_new_x(new_col)
 
@@ -473,34 +396,32 @@ def convert_hit_objects(hit_object_lines):
                     'hitSound': obj['hitSound'],
                     'hitSample': obj['hitSample'],
                     'is_new_combo': obj['is_new_combo'],
-                    'is_long': obj['is_long'],          # preserve long notes
-                    'endTime': obj['endTime'],          # preserve end time
+                    'is_long': obj['is_long'],          # 长条保留
+                    'endTime': obj['endTime'],          # 结尾时间保留
                 }
                 regular_notes.append(new_obj)
 
-                # ---- Build unified interval ----
+                # ---- 构建点/区间 ----
                 if obj['is_long'] and obj['endTime'] is not None:
-                    iv_start = obj['time'] - INTERVAL_MARGIN
-                    iv_end = obj['endTime'] + INTERVAL_MARGIN
+                    span = (obj['time'], obj['endTime'])
                 else:
-                    iv_start = obj['time'] - INTERVAL_MARGIN
-                    iv_end = obj['time'] + INTERVAL_MARGIN
+                    span = (obj['time'], obj['time'])
 
-                # Insert sorted by start time
-                ins_idx = bisect.bisect_left(
-                    col_intervals[new_col], (iv_start, iv_end))
-                col_intervals[new_col].insert(ins_idx, (iv_start, iv_end))
+                # 按起点有序插入
+                ins_idx = bisect.bisect_left(col_spans[new_col], span)
+                col_spans[new_col].insert(ins_idx, span)
 
-    # ---- Phase 2 --------------------------------------------------------
-    # Density filter: a candidate survives only when at most `a` other
-    # notes start within ±250 ms of it (a 0.5 s window, a = NEARBY_NOTE_LIMIT).
+    # ---- 阶段 2 --------------------------------------------------------
+    # 密度过滤：窗口内起始的其它音符数 ≤ a 才保留
     eligible_candidates = [
         obj for obj in transfer_candidates
         if can_transfer(obj['time'], all_start_times)
     ]
-    resolved_notes = resolve_transfers(eligible_candidates, col_intervals)
+    # 固定种子随机源：同一谱面重复转换，并列选择结果完全一致
+    rng = random.Random(RANDOM_SEED)
+    resolved_notes = resolve_transfers(eligible_candidates, col_spans, rng)
 
-    # ---- Phase 3 --------------------------------------------------------
+    # ---- 阶段 3 --------------------------------------------------------
     all_notes = regular_notes + resolved_notes
     all_notes.sort(key=lambda o: (o['time'], o['x']))
 
@@ -513,10 +434,10 @@ def convert_hit_objects(hit_object_lines):
     return output
 
 
-# ====================== File-Level Conversion ======================
+# ====================== 文件级转换 ======================
 
 def _modify_creator(line):
-    """Append '&ssaj' to the Creator metadata value."""
+    """Creator 值追加 '&ssaj'。"""
     m = re.match(r'(Creator\s*:\s*)(.*)', line)
     if m:
         return f"{m.group(1)}{m.group(2).rstrip()}&ssaj\n"
@@ -524,7 +445,7 @@ def _modify_creator(line):
 
 
 def _modify_version(line):
-    """Append '_726k' to the Version metadata value."""
+    """Version 值追加 '_726k'。"""
     m = re.match(r'(Version\s*:\s*)(.*)', line)
     if m:
         return f"{m.group(1)}{m.group(2).rstrip()}_726k\n"
@@ -532,26 +453,21 @@ def _modify_version(line):
 
 
 def _modify_beatmap_id(line):
-    """Force BeatmapID to 0."""
+    """BeatmapID 置 0。"""
     return re.sub(r'(BeatmapID\s*:\s*)\d+', r'\g<1>0', line)
 
 
 def _modify_circle_size(line):
-    """Force CircleSize to 6."""
+    """CircleSize 置 6。"""
     return re.sub(r'(CircleSize\s*:\s*)\d+', r'\g<1>6', line)
 
 
 def is_mania_7k(osu_path):
     """
-    Return True if *osu_path* is a mania-7K beatmap.
+    判断 *osu_path* 是否为 mania 7K 谱面。
 
-    Reads the file line-by-line and stops early — Mode and CircleSize
-    always appear in the first ~40 lines ([General] and [Difficulty]
-    sections)
-
-    Checks:
-      - Mode: 3          (osu!mania)
-      - CircleSize: 7    (7 keys)
+    逐行读取并尽早停止（Mode 与 CircleSize 总在前约 40 行内）。
+    检查：Mode=3（osu!mania）、CircleSize=7（7 键）。
     """
     mode = None
     circle_size = None
@@ -561,12 +477,11 @@ def is_mania_7k(osu_path):
             for line in f:
                 stripped = line.strip()
 
-                # ---- Section headers ----
-                # Once we pass [HitObjects] we can stop
+                # ---- 到达 [HitObjects] 即可停止 ----
                 if stripped == '[HitObjects]':
                     break
 
-                # ---- Mode (in [General]) ----
+                # ---- Mode（[General] 段）----
                 if mode is None and stripped.startswith('Mode:'):
                     try:
                         mode = int(stripped.split(':')[1].strip())
@@ -575,7 +490,7 @@ def is_mania_7k(osu_path):
                     if mode != 3:
                         return False
 
-                # ---- CircleSize (in [Difficulty]) ----
+                # ---- CircleSize（[Difficulty] 段）----
                 if circle_size is None and stripped.startswith('CircleSize:'):
                     try:
                         circle_size = int(stripped.split(':')[1].strip())
@@ -584,7 +499,7 @@ def is_mania_7k(osu_path):
                     if circle_size != 7:
                         return False
 
-                # Both checks done — no need to read further
+                # 两项都确定后无需继续读
                 if mode is not None and circle_size is not None:
                     break
 
@@ -596,12 +511,11 @@ def is_mania_7k(osu_path):
 
 def convert_osu_file(osu_path):
     """
-    Convert one .osu file from 7K to 6K.
+    转换单个 .osu 文件（7K → 6K）。
 
-    Returns the path of the newly-created file, or None on failure.
-    The original file is never modified.
+    返回新文件路径，失败返回 None。原文件不会被修改。
     """
-    # ---- Read original ----
+    # ---- 读取原文件 ----
     try:
         with open(osu_path, 'r', encoding='utf-8-sig') as f:
             lines = f.readlines()
@@ -609,7 +523,7 @@ def convert_osu_file(osu_path):
         print(f"    ERROR reading file: {e}")
         return None
 
-    # ---- Locate [HitObjects] ----
+    # ---- 定位 [HitObjects] ----
     hit_objects_header_idx = None
     raw_hit_object_lines = []
 
@@ -620,7 +534,7 @@ def convert_osu_file(osu_path):
             continue
         if hit_objects_header_idx is not None:
             if stripped.startswith('['):
-                break          # next section — shouldn't happen, but be safe
+                break          # 遇到下一节（正常不会有，稳妥起见）
             if stripped:
                 raw_hit_object_lines.append(stripped)
 
@@ -631,25 +545,24 @@ def convert_osu_file(osu_path):
         print(f"    [HitObjects] is empty — skipping")
         return None
 
-    # ---- Convert HitObjects ----
+    # ---- 转换 HitObjects ----
     converted_hos = convert_hit_objects(raw_hit_object_lines)
 
-    # ---- Assemble output ----
+    # ---- 组装输出 ----
     output_lines = []
 
     for line in lines:
         stripped = line.strip()
 
         if stripped == '[HitObjects]':
-            # [HitObjects] is always the last section per the osu! spec,
-            # so we can write the converted objects and stop immediately.
+            # [HitObjects] 按规范恒为最后一节，写入转换结果后即可停止
             output_lines.append(line)
             for ho in converted_hos:
                 output_lines.append(ho + '\n')
             output_lines.append('\n')
             break
 
-        # ---- Apply metadata patches before [HitObjects] ----
+        # ---- 在 [HitObjects] 之前应用元数据补丁 ----
         if stripped.startswith('Creator:'):
             line = _modify_creator(line)
         elif stripped.startswith('Version:'):
@@ -661,7 +574,7 @@ def convert_osu_file(osu_path):
 
         output_lines.append(line)
 
-    # ---- Write new file ----
+    # ---- 写入新文件 ----
     dir_name = os.path.dirname(osu_path)
     base_name = os.path.basename(osu_path)
     stem, ext = os.path.splitext(base_name)
@@ -677,25 +590,20 @@ def convert_osu_file(osu_path):
         return None
 
 
-# ====================== Batch Mode ======================
+# ====================== 批量模式 ======================
 
 def get_songs_dir():
     """
-    Return the osu! Songs directory.
+    返回 osu! Songs 目录（为当前用户硬编码）。
 
-    Hard-coded for the current user.  If you are running this script on a
-    different machine, change the path below to your own osu! Songs folder.
-    You can find it by opening osu! → Options → "Open osu! folder",
-    then entering the "Songs" sub-directory.
+    换机器运行请改成你自己的 Songs 路径：osu! → Options →
+    "Open osu! folder"，进入其中的 Songs 子目录。
     """
     return r'C:\Users\SmdSa\AppData\Local\osu!\Songs'
 
 
 def batch_convert():
-    """
-    Walk the osu! Songs folder, find 7K mania .osu files,
-    and create a converted 6K copy alongside each.
-    """
+    """遍历 osu! Songs 目录，找出 7K mania 谱面，逐个生成 6K 副本。"""
     songs_dir = get_songs_dir()
 
     if not songs_dir:
@@ -708,7 +616,7 @@ def batch_convert():
 
     print(f"\nSongs folder: {songs_dir}\n")
 
-    # Collect sub-folders (each = one beatmap set)
+    # 收集子文件夹（每个 = 一个谱面集）
     try:
         entries = sorted(
             [e for e in os.listdir(songs_dir)
@@ -731,10 +639,10 @@ def batch_convert():
 
     for idx, entry in enumerate(entries, start=1):
         subdir = os.path.join(songs_dir, entry)
-        # Progress:  completed / total
+        # 进度：已完成 / 总数
         print(f"[{idx}/{total}]  {entry}")
 
-        # Gather .osu files
+        # 收集 .osu 文件
         try:
             osu_files = [
                 os.path.join(subdir, f)
@@ -749,7 +657,7 @@ def batch_convert():
         any_converted = False
         for osu_path in osu_files:
             if not is_mania_7k(osu_path):
-                continue          # not a 7K mania — skip silently
+                continue          # 非 7K mania —— 静默跳过
 
             result = convert_osu_file(osu_path)
             if result:
@@ -768,7 +676,7 @@ def batch_convert():
     print("=" * 45)
 
 
-# ====================== Main ======================
+# ====================== 主程序 ======================
 
 def main():
     print("=" * 50)

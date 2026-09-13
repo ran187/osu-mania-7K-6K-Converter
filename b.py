@@ -25,8 +25,8 @@ osu!mania 7K → 6K 谱面转换器（密度感知的第 4 列转移）
        （列 < 3 不动，列 > 3 减 1），长条保持长条。
      - 列 4（0 基：3）：按上述规则转移或丢弃；转移目标为 6 列
        中最近按键距离最大、且 d ≥ MIN_TRANSFER_GAP 的列
-       （并列按固定种子随机，见 resolve_transfers）；一律变为
-       普通音符。
+       （并列随机，种子为并列数+音符时间，见 resolve_transfers）；
+       一律变为普通音符。
   3. 输出新 .osu 文件，文件名加 "_[726k]" 后缀；原文件不动。
 """
 
@@ -57,10 +57,6 @@ NEARBY_NOTE_LIMIT = 6
 # 间距阈值（ms）：K 到 6 个目标列各自最近按键的距离（到点或
 # 区间）取最大值 d，d 仍小于该值 → 所有列都太挤，放弃转移。
 MIN_TRANSFER_GAP = 125
-
-# 并列选择用的固定随机种子：保证同一谱面重复转换时并列选择
-# 结果一致，两次生成的谱面完全相同。
-RANDOM_SEED = 114514
 
 
 # ====================== 辅助函数 ======================
@@ -223,7 +219,7 @@ def can_transfer(t, all_start_times, limit=NEARBY_NOTE_LIMIT):
     return nearby <= limit
 
 
-def resolve_transfers(transfer_candidates, col_spans, rng=None):
+def resolve_transfers(transfer_candidates, col_spans):
     """
     为每个通过密度检查的候选挑选目标 6K 列。
 
@@ -245,17 +241,15 @@ def resolve_transfers(transfer_candidates, col_spans, rng=None):
       - 列为空               → +∞
 
     取 6 列距离的最大值 d（空隙最大，对其它列打扰最小）；空列
-    （+∞）恒胜，因此稀疏段会落到空闲列上。并列时按固定种子随机
-    选一列（同一谱面多次转换结果一致；rng 未传入时退回模块级
-    random）。若 d < MIN_TRANSFER_GAP，所有列都太挤，丢弃候选。
+    （+∞）恒胜，因此稀疏段会落到空闲列上。并列时以「并列数 n +
+    音符时间」为种子的随机选择：同一谱面多次转换结果一致，且
+    选择不会集中在某一列。若 d < MIN_TRANSFER_GAP，所有列都太
+    挤，丢弃候选。
     转移后的音符一律为普通音符（type 1）。
 
     返回新音符 dict 列表（含目标列的 x 坐标）；未通过间距检查
     的候选被省略。
     """
-    if rng is None:
-        rng = random                  # 未显式传入时退回模块级随机源
-
     # 每列按起点有序的点/区间表，以及"前 i 项 end 的最大值"前缀表
     col_starts = [[s for s, _ in spans] for spans in col_spans]
     col_end_prefix = []
@@ -308,7 +302,14 @@ def resolve_transfers(transfer_candidates, col_spans, rng=None):
             continue
 
         # ---- 选定目标列 ----
-        target_col = rng.choice(best_cols)
+        if len(best_cols) == 1:
+            # 唯一最优：直接选定
+            target_col = best_cols[0]
+        else:
+            # 并列：种子 = 并列数 n + 音符时间。同一谱面重复转换
+            # 结果一致；不同时间、不同谱面种子不同，选择不集中
+            seed = len(best_cols) + obj['time']
+            target_col = random.Random(seed).choice(best_cols)
         new_x = get_new_x(target_col)
 
         new_obj = {
@@ -345,7 +346,7 @@ def convert_hit_objects(hit_object_lines):
           （a = NEARBY_NOTE_LIMIT）才保留
         - 幸存候选交给 resolve_transfers：K 到各列最近按键
           距离的最大值 d ≥ MIN_TRANSFER_GAP 才转移，目标列为
-          d 所在列（并列随机）
+          d 所在列（并列随机，种子为并列数+音符时间）
 
       阶段 3 — 合并常规与转移音符，按 (time, x) 排序，
                用 format_hit_object 序列化。
@@ -417,9 +418,7 @@ def convert_hit_objects(hit_object_lines):
         obj for obj in transfer_candidates
         if can_transfer(obj['time'], all_start_times)
     ]
-    # 固定种子随机源：同一谱面重复转换，并列选择结果完全一致
-    rng = random.Random(RANDOM_SEED)
-    resolved_notes = resolve_transfers(eligible_candidates, col_spans, rng)
+    resolved_notes = resolve_transfers(eligible_candidates, col_spans)
 
     # ---- 阶段 3 --------------------------------------------------------
     all_notes = regular_notes + resolved_notes

@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-osu! Beatmap Download Converter  (Density-Aware Column-4 Transfer)
-====================================================================
+osu! 谱面下载包转换器（密度感知的第 4 列转移）
+==============================================
 
-Checks the Downloads folder for .osz beatmap packages, extracts them,
-converts 7K mania beatmaps to 6K using b.py (density-aware column-4
-transfer), then re-packages as .osz.
+扫描 Downloads 文件夹中的 .osz 谱面包：解压 → 用 b.py 把其中的
+7K mania 谱面转换为 6K（密度感知的第 4 列转移）→ 重新打包为 .osz。
 
-Each 7K beatmap in the package gets one 6K copy:
-  - _[726k].osu   — column-4 notes kept or dropped by a density check
-    (b.py)
+谱面包中的每个 7K 谱面都会得到一份 6K 副本：
+  - _[726k].osu   — 第 4 列音符按密度检查转移或丢弃（b.py）
 """
 
 import os
@@ -19,31 +17,28 @@ import tempfile
 import shutil
 import glob
 
-# Import conversion functions from b.py.
-# The module guards main() with "if __name__ == '__main__'", so the import
-# is side-effect-free apart from defining its functions.
+# 从 b.py 导入转换函数
 import b
 
-# ====================== Configuration ======================
+# ====================== 配置 ======================
 
 DOWNLOADS = r'C:\Users\SmdSa\Downloads'
 
 
-# ====================== Core ======================
+# ====================== 核心 ======================
 
 def find_osz_files(downloads_dir):
-    """Return a sorted list of absolute paths to .osz files."""
+    """返回 downloads_dir 下所有 .osz 文件的绝对路径（有序）。"""
     pattern = os.path.join(downloads_dir, '*.osz')
     return sorted(glob.glob(pattern))
 
 
 def process_osz(osz_path):
     """
-    Extract *osz_path* to a temporary directory, convert every 7K mania
-    .osu file found inside (b.py style, density-aware column-4 transfer),
-    then re-pack everything back into the original .osz.
+    把 *osz_path* 解压到临时目录，转换其中所有 7K mania 谱面
+    （b.py 风格，密度感知的第 4 列转移），再整体打包回原 .osz。
 
-    Returns True if at least one conversion took place, False otherwise.
+    至少转换了一个谱面时返回 True，否则返回 False。
     """
     base = os.path.basename(osz_path)
     print(f"\n  Processing: {base}")
@@ -52,11 +47,11 @@ def process_osz(osz_path):
     converted_any = False
 
     try:
-        # ---- 1. Extract ----
+        # ---- 1. 解压 ----
         with zipfile.ZipFile(osz_path, 'r') as zf:
             zf.extractall(tmp)
 
-        # ---- 2. Walk & convert ----
+        # ---- 2. 遍历并转换 ----
         for root, _dirs, files in os.walk(tmp):
             for fname in files:
                 if not fname.lower().endswith('.osu'):
@@ -64,7 +59,7 @@ def process_osz(osz_path):
                 full = os.path.join(root, fname)
 
                 if not b.is_mania_7k(full):
-                    continue          # not 7K mania — skip
+                    continue          # 非 7K mania —— 跳过
 
                 r_b = b.convert_osu_file(full)
 
@@ -75,7 +70,7 @@ def process_osz(osz_path):
         if not converted_any:
             print("    (no 7K mania beatmaps found)")
 
-        # ---- 3. Re-pack (write to temp file first for safety) ----
+        # ---- 3. 重新打包（先写临时文件再原子替换，避免半成品） ----
         if converted_any:
             tmp_osz = osz_path + '.tmp'
             with zipfile.ZipFile(tmp_osz, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -97,7 +92,7 @@ def process_osz(osz_path):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ====================== Main ======================
+# ====================== 主程序 ======================
 
 def main():
     print("=" * 50)
@@ -121,12 +116,7 @@ def main():
         print(f"  {os.path.basename(f)}")
 
     print()
-    answer = input("Convert all? (Y/N): ").strip().upper()
-
-    if answer != 'Y':
-        print("Exiting.")
-        return
-
+    input("Press Enter to start conversion...")
     print("\n" + "=" * 45)
 
     converted = 0

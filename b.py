@@ -1,33 +1,8 @@
 #!/usr/bin/env python3
 """
-osu!mania 7K → 6K 谱面转换器（密度感知的第 4 列转移）
-====================================================
-
-将 7K 谱面转换为 6K。第 1/2/3/5/6/7 列直接重映射并保留
-（长条保持长条）；只有第 4 列（0 基索引 3）会被移除或转移：
-
-- 与其它音符同时间出现 → 直接丢弃
-- 单独出现 → 密度检查：统计 ±250 ms（0.5 s 窗口）内起始的
-  其它音符数
-  - 数量 ≤ a（NEARBY_NOTE_LIMIT，默认 6）→ 进入间距检查
-  - 数量 > a → 丢弃：附近密集，丢弃以保护其它列的手感
-  （±250 ms 窗口内出现 7 个以上其它音符，即约每秒 14 个
-  音符以上，视为密集）
-- 通过密度检查 → 间距检查：分别求 K 到 6 个目标列最近按键的
-  距离（普通音符为点，长条为其起止区间），取 6 列最大值 d；
-  d ≥ MIN_TRANSFER_GAP（125 ms）才转移，否则丢弃
-
-转换规则：
-  1. 元数据：Creator 追加 "&ssaj"，Version 追加 "_726k"，
-     BeatmapID 置 0，CircleSize 置 6。
-  2. [HitObjects]：
-     - 列 1/2/3/5/6/7（0 基：0,1,2,4,5,6）：重映射到 6K 列
-       （列 < 3 不动，列 > 3 减 1），长条保持长条。
-     - 列 4（0 基：3）：按上述规则转移或丢弃；转移目标为 6 列
-       中最近按键距离最大、且 d ≥ MIN_TRANSFER_GAP 的列
-       （并列随机，种子为并列数+音符时间，见 resolve_transfers）；
-       一律变为普通音符。
-  3. 输出新 .osu 文件，文件名加 "_[726k]" 后缀；原文件不动。
+osu!mania 7K → 6K 谱面转换器：删除第 4 列（0 基索引 3）并按
+密度/间距检查转移或舍弃，其余列直接重映射；输出文件名加
+"_[726k]" 后缀。
 """
 
 import bisect
@@ -44,18 +19,18 @@ TYPE_NORMAL = 1            # 普通音符的 type
 TYPE_HOLD = 128            # mania 长条掩码
 NEW_COMBO_FLAG = 4         # new-combo 标志位（type 字段第 2 位）
 
-# 密度检查窗口的半宽（ms）：统计第 4 列单独音符 K 在
-# ±DENSITY_WINDOW（0.5 s 窗口）内起始的其它音符数（can_transfer）。
+# 密度检查窗口半宽（ms）：统计 ±DENSITY_WINDOW 内其它音符的
+# 起始数 Nk 与按下时间数 Nt（can_transfer）。
 DENSITY_WINDOW = 250
 
-# 密度阈值（参数 a）：第 4 列单独音符在 ±DENSITY_WINDOW 窗口内
-# 起始的其它音符超过该数量时丢弃，否则进入间距检查。
-# 实际测试把这个值设为6，调得越大，转谱的结果越卡手
-# 如果设置成-1，结果等于“直接删除第4轨道"
-NEARBY_NOTE_LIMIT = 6   
+# 密度阈值：Nk 与 Nt 同时超限才舍弃 K4（见 can_transfer）。
+# 任一设为 -1 等于直接删除第 4 轨道。
+NEARBY_NOTE_LIMIT = 4
 
-# 间距阈值（ms）：K 到 6 个目标列各自最近按键的距离（到点或
-# 区间）取最大值 d，d 仍小于该值 → 所有列都太挤，放弃转移。
+NEARBY_TIME_LIMIT = 3
+
+# 间距阈值（ms）：K 到 6 列各自最近按键距离的最大值 d 小于
+# 它 → 放弃转移。
 MIN_TRANSFER_GAP = 125
 
 
@@ -75,12 +50,7 @@ def get_new_x(col, key_count=TARGET_KEYS):
 
 def parse_hit_object(line):
     """
-    解析一行 [HitObjects]。
-
-    支持两种格式：
-      - 普通：x, y, time, type, hitSound, hitSample
-      - 长条：x, y, time, type, hitSound, endTime:hitSample
-
+    解析一行 [HitObjects]（普通音符 / 长条两种格式），
     返回 dict；无效行返回 None。
     """
     line = line.strip()
@@ -145,10 +115,9 @@ def format_hit_object(obj, ensure_new_combo=False):
     """
     把音符 dict 序列化回 .osu 行。
 
-    - 普通音符：type 为 1；若为谱面第一个音符（ensure_new_combo）
-      或原有 new-combo 标志则为 5。
-    - 长条：type 恒为 128，不应用 new-combo（即使是第一个音符）；
-      尾部用 "endTime:hitSample" 格式（mania 谱面惯例）。
+    - 普通音符：type 为 1；首个音符（ensure_new_combo）或原有
+      new-combo 标志时为 5。
+    - 长条：type 恒为 128，尾部用 "endTime:hitSample" 格式。
     """
     if obj.get('is_long'):
         # 长条：type 恒为 128
@@ -172,9 +141,7 @@ def format_hit_object(obj, ensure_new_combo=False):
 
 def read_groups(hit_object_lines):
     """
-    按起始时间分组产出音符。
-
-    每个元素：(time_in_ms, [音符 dict 列表])
+    按起始时间分组产出音符：每个元素 (time, [音符 dict 列表])。
     [HitObjects] 按时间排序，故只需比较相邻行。
     """
     current_time = None
@@ -201,54 +168,50 @@ def read_groups(hit_object_lines):
 
 # ====================== 转移解析 ======================
 
-def can_transfer(t, all_start_times, limit=NEARBY_NOTE_LIMIT):
+def can_transfer(t, all_start_times, distinct_start_times,
+                 limit=NEARBY_NOTE_LIMIT, time_limit=NEARBY_TIME_LIMIT):
     """
     密度检查：第 4 列单独音符（时间 t）能否转移？
 
-    统计 ±DENSITY_WINDOW（0.5 s 窗口）内其它音符的起始数：
-      - count ≤ limit → True（稀疏 → 进入间距检查）
-      - count > limit → False（密集 → 丢弃，保护手感）
+    统计 ±DENSITY_WINDOW 窗口内其它音符的起始数 Nk 与按下
+    时间数 Nt（去重）。Nk > limit 且 Nt > time_limit →
+    False（舍弃），否则 True（进入间距检查）。
 
     all_start_times 为全体音符起始时间的有序列表（含第 4 列），
-    两次二分查找即可得窗口内数量（O(log N)）。候选音符在其时间
-    点上仅此一个，故计数减 1。
+    distinct_start_times 为其去重后的有序列表。候选在其时间点
+    仅此一个，故两个计数各减 1。limit / time_limit 为负数时
+    一律 False。
     """
+    if limit < 0 or time_limit < 0:
+        return False
+
     lo = bisect.bisect_left(all_start_times, t - DENSITY_WINDOW)
     hi = bisect.bisect_right(all_start_times, t + DENSITY_WINDOW)
-    nearby = (hi - lo) - 1          # 窗口内音符数减去候选自身
-    return nearby <= limit
+    nk = (hi - lo) - 1              # 窗口内其它音符数（减去候选自身）
+
+    lo_t = bisect.bisect_left(distinct_start_times, t - DENSITY_WINDOW)
+    hi_t = bisect.bisect_right(distinct_start_times, t + DENSITY_WINDOW)
+    nt = (hi_t - lo_t) - 1          # 窗口内其它按下时间数（减去 t 自身）
+
+    return not (nk > limit and nt > time_limit)
 
 
 def resolve_transfers(transfer_candidates, col_spans):
     """
-    为每个通过密度检查的候选挑选目标 6K 列。
+    为通过密度检查的候选挑选目标 6K 列。
 
-    密度资格已在调用前由 can_transfer 判定；本函数做间距检查并
-    选目标列：6 列中 K 到最近按键距离的最大值 d 必须
-    ≥ MIN_TRANSFER_GAP，否则候选在所有列上都离已有按键太近，
-    丢弃。
-
-    点 / 区间模型
-    -------------
-    每个非第 4 列音符是一个点或区间：
-      - 普通音符 T   → 点 T
-      - 长条 S..E    → 区间 [S, E]
-
-    对候选时间 T，在 6 个目标列上分别计算 T 到最近按键的距离：
+    每个非第 4 列音符按列存为点/区间（普通音符为点 T，长条为
+    区间 [S, E]）；对候选时间 T 求 6 列各自最近按键的距离：
       - T 在区间内（含端点）→ 0
-      - T 在点/区间左侧      → start - T
-      - T 在点/区间右侧      → T - end
-      - 列为空               → +∞
+      - T 在左侧 → start - T；T 在右侧 → T - end
+      - 列为空 → +∞
 
-    取 6 列距离的最大值 d（空隙最大，对其它列打扰最小）；空列
-    （+∞）恒胜，因此稀疏段会落到空闲列上。并列时以「并列数 n +
-    音符时间」为种子的随机选择：同一谱面多次转换结果一致，且
-    选择不会集中在某一列。若 d < MIN_TRANSFER_GAP，所有列都太
-    挤，丢弃候选。
-    转移后的音符一律为普通音符（type 1）。
+    取最大值 d 所在列为目标；d < MIN_TRANSFER_GAP → 丢弃。
+    并列时以「并列数 n + 音符时间」为种子随机选择。转移后的
+    音符一律为普通音符。
 
-    返回新音符 dict 列表（含目标列的 x 坐标）；未通过间距检查
-    的候选被省略。
+    返回新音符 dict 列表（含目标列的 x 坐标）；未通过间距
+    检查的候选被省略。
     """
     # 每列按起点有序的点/区间表，以及"前 i 项 end 的最大值"前缀表
     col_starts = [[s for s, _ in spans] for spans in col_spans]
@@ -272,7 +235,7 @@ def resolve_transfers(transfer_candidates, col_spans):
             starts = col_starts[col]
 
             if not starts:
-                # 空列 —— 理想选择
+                # 空列
                 d = float('inf')
             else:
                 idx = bisect.bisect_right(starts, T)
@@ -290,24 +253,23 @@ def resolve_transfers(transfer_candidates, col_spans):
 
                 d = min(d_left, d_right)
 
-            # ---- 记录跨列的最大最近距离 ----
+            # 跨列最大最近距离
             if d > best_d:
                 best_d = d
                 best_cols = [col]
             elif d == best_d:
                 best_cols.append(col)
 
-        # ---- 间距检查：最佳列仍比 MIN_TRANSFER_GAP 更近 → 丢弃 ----
+        # 间距检查：d < MIN_TRANSFER_GAP → 丢弃
         if best_d < MIN_TRANSFER_GAP:
             continue
 
-        # ---- 选定目标列 ----
+        # 选定目标列
         if len(best_cols) == 1:
-            # 唯一最优：直接选定
+            # 唯一最优
             target_col = best_cols[0]
         else:
-            # 并列：种子 = 并列数 n + 音符时间。同一谱面重复转换
-            # 结果一致；不同时间、不同谱面种子不同，选择不集中
+            # 并列：种子 = 并列数 n + 音符时间（结果确定）
             seed = len(best_cols) + obj['time']
             target_col = random.Random(seed).choice(best_cols)
         new_x = get_new_x(target_col)
@@ -333,23 +295,12 @@ def convert_hit_objects(hit_object_lines):
     """
     将 [HitObjects] 段从 7K 转 6K。三阶段算法：
 
-      阶段 1 — 按时间顺序单遍扫描各分组：
-        - 非第 4 列：重映射列与 x，长条保留，加入输出池；
-          同时按列构建点/区间表（普通音符为点、长条为起止
-          区间，供间距检查用）
-        - 第 4 列单独：加入转移候选
-        - 第 4 列有伴：静默丢弃
-        - 收集全体音符起始时间的有序表（供密度检查二分查找）
-
-      阶段 2 — 密度过滤并解析转移（按时间序）：
-        - can_transfer 过滤：±250 ms 窗口内起始的其它音符 ≤ a
-          （a = NEARBY_NOTE_LIMIT）才保留
-        - 幸存候选交给 resolve_transfers：K 到各列最近按键
-          距离的最大值 d ≥ MIN_TRANSFER_GAP 才转移，目标列为
-          d 所在列（并列随机，种子为并列数+音符时间）
-
-      阶段 3 — 合并常规与转移音符，按 (time, x) 排序，
-               用 format_hit_object 序列化。
+      阶段 1 — 按时间序扫描分组：非第 4 列重映射列与 x
+        （长条保留）并构建点/区间表；第 4 列单独 → 候选，
+        有伴 → 丢弃；同时收集全体起始时间表与去重时间表。
+      阶段 2 — can_transfer 密度过滤（Nk 与 Nt 同时超限才
+        舍弃），幸存候选交 resolve_transfers 做间距检查并转移。
+      阶段 3 — 合并常规与转移音符，按 (time, x) 排序后序列化。
     """
     # 各列音符点/区间表（按起点排序）：
     #   普通音符 T → (T, T)
@@ -358,6 +309,8 @@ def convert_hit_objects(hit_object_lines):
 
     # 全体音符起始时间的有序表（含第 4 列），供密度检查二分查找
     all_start_times = []
+    # 上述时间去重后的有序表（按下时间数 Nt 用）
+    distinct_start_times = []
 
     regular_notes = []          # 直接重映射的输出音符
     transfer_candidates = []    # 第 4 列单独音符（已按时间序）
@@ -380,6 +333,10 @@ def convert_hit_objects(hit_object_lines):
 
             # ---- 记录全局起始时间 ----
             bisect.insort(all_start_times, obj['time'])
+            # 分组按时间非降产出，故去重表只需与末项比较后追加
+            if (not distinct_start_times
+                    or distinct_start_times[-1] != obj['time']):
+                distinct_start_times.append(obj['time'])
 
             if col == DELETED_COL:
                 if is_col3_alone:
@@ -413,10 +370,10 @@ def convert_hit_objects(hit_object_lines):
                 col_spans[new_col].insert(ins_idx, span)
 
     # ---- 阶段 2 --------------------------------------------------------
-    # 密度过滤：窗口内起始的其它音符数 ≤ a 才保留
+    # 密度过滤：Nk 与 Nt 同时超限才舍弃
     eligible_candidates = [
         obj for obj in transfer_candidates
-        if can_transfer(obj['time'], all_start_times)
+        if can_transfer(obj['time'], all_start_times, distinct_start_times)
     ]
     resolved_notes = resolve_transfers(eligible_candidates, col_spans)
 
@@ -463,10 +420,8 @@ def _modify_circle_size(line):
 
 def is_mania_7k(osu_path):
     """
-    判断 *osu_path* 是否为 mania 7K 谱面。
-
-    逐行读取并尽早停止（Mode 与 CircleSize 总在前约 40 行内）。
-    检查：Mode=3（osu!mania）、CircleSize=7（7 键）。
+    判断 *osu_path* 是否为 mania 7K 谱面（Mode=3 且
+    CircleSize=7）。逐行读取并尽早停止。
     """
     mode = None
     circle_size = None
@@ -680,7 +635,8 @@ def batch_convert():
 def main():
     print("=" * 50)
     print("   osu!mania  7K  -->  6K  Beatmap Converter")
-    print(f"   (Density-Aware Transfer, a={NEARBY_NOTE_LIMIT})")
+    print(f"   (Density-Aware Transfer, drop when "
+          f"Nk>{NEARBY_NOTE_LIMIT} & Nt>{NEARBY_TIME_LIMIT})")
     print("=" * 50)
 
     batch_convert()
